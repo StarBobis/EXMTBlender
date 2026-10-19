@@ -498,19 +498,22 @@ def _animation_actions(folder: str, rig, bones: list, label: str) -> tuple:
         for b in bones
     ]
     bl_bones = [rig.data.bones.get(b.get("name") or "") for b in bones]
-    # index of each bone's *Blender* parent, and Blender's own rest relationship
+    # index of each bone's *Blender* parent, and Blender's own rest matrix.
+    #
+    # The rig this addon builds is only an *approximation* of the game's bind
+    # pose: `build_armature` derives each bone from head + Y + roll, and measured
+    # on a real workspace 18 of 32 bones end up 10–179° off in roll.  Skinning
+    # uses `bone.matrix_local` as the rest reference, so a pose computed against
+    # the *game's* rest twists the mesh.  Fix: never trust matrix_local as the
+    # bind — convert the desired **deform** (game bone world · game rest⁻¹) into
+    # a pose matrix through matrix_local, which cancels any rest mismatch.
     bl_parent = []
     for bone in bl_bones:
         parent = bone.parent if bone is not None else None
         bl_parent.append(next((j for j, other in enumerate(bl_bones) if other == parent), -1)
                          if parent is not None else -1)
-    # rest relationship in Blender's own armature (parent rest)⁻¹ · bone rest
-    offset = []
-    for i, bone in enumerate(bl_bones):
-        if bone is not None and bone.parent is not None:
-            offset.append(bone.parent.matrix_local.inverted() @ bone.matrix_local)
-        else:
-            offset.append((rest[i] if bone is None else bone.matrix_local))
+    bl_local = [(bone.matrix_local.copy() if bone is not None else rest[i])
+                for i, bone in enumerate(bl_bones)]
 
     here = os.path.abspath(folder)
     # a re-import replaces this workspace's actions instead of piling up `.001`
@@ -519,6 +522,8 @@ def _animation_actions(folder: str, rig, bones: list, label: str) -> tuple:
             bpy.data.actions.remove(old)
 
     made = []
+    skipped = []      # (clip, "N/M") — this rig cannot drive it at all
+    partial = []      # (clip, matched, animated) — it will look incomplete
     for row in rows:
         rel = row.get("file") or ""
         path = os.path.join(folder, rel)
@@ -538,8 +543,17 @@ def _animation_actions(folder: str, rig, bones: list, label: str) -> tuple:
             index = by_hash.get(int(track.get("hash") or 0))
             if index is not None:
                 tracks[index] = track
+        animated = len(data.get("bones") or [])
         if not tracks:
+            skipped.append((row.get("clip") or rel, animated))
             continue
+        # 这套骨架撑不起这个动作时，别硬套：只说清"匹配了几根"，并且太差就不建 Action
+        coverage = len(tracks) / max(1, animated)
+        if coverage < 0.5:
+            skipped.append((row.get("clip") or rel, "%d/%d" % (len(tracks), animated)))
+            continue
+        if coverage < 0.95:
+            partial.append((row.get("clip") or rel, len(tracks), animated))
         # the clip's own hierarchy wins; fall back to the skeleton's parent index
         parent = []
         for i, bone in enumerate(bones):
@@ -593,13 +607,17 @@ def _animation_actions(folder: str, rig, bones: list, label: str) -> tuple:
                 bone = bl_bones[i]
                 if bone is None:
                     continue
-                # Blender's own parent chain decides the rest offset, so the parent
-                # world must come from *that* chain too (the clip's chain can differ
-                # where the skeleton's parents were only inferred)
+                # deform the mesh the way the game does, then express it through
+                # Blender's own rest: pose = (world · game_rest⁻¹) · matrix_local
+                pose_want = world[i] @ rest[i].inverted() @ bl_local[i]
                 blp = bl_parent[i]
-                parent_world = (world[blp] if blp in world else rest[blp]) if blp >= 0 else Matrix.Identity(4)
-                base_world = parent_world @ offset[i] if blp >= 0 else offset[i]
-                basis = base_world.inverted() @ world[i]
+                if blp >= 0:
+                    parent_pose = (world[blp] @ rest[blp].inverted() @ bl_local[blp]
+                                   if blp in world else bl_local[blp])
+                    base_pose = parent_pose @ bl_local[blp].inverted() @ bl_local[i]
+                else:
+                    base_pose = bl_local[i]
+                basis = base_pose.inverted() @ pose_want
                 loc, quat, scale = basis.decompose()
                 row = channels[i]
                 row["location"].extend((float(step + 1), loc.x, loc.y, loc.z))
@@ -647,10 +665,16 @@ def _animation_actions(folder: str, rig, bones: list, label: str) -> tuple:
             track.mute = True
         except Exception:
             pass
+        action["exmt_bones"] = len(tracks)
+        action["exmt_clip_bones"] = animated
         made.append((action, slot, steps))
 
+    notes = {
+        "skipped": skipped,
+        "partial": partial,
+    }
     if not made:
-        return 0, []
+        return 0, [], notes
     # the first clip is live, so the user sees motion immediately
     action, slot, steps = made[0]
     rig.animation_data.action = action
@@ -662,7 +686,7 @@ def _animation_actions(folder: str, rig, bones: list, label: str) -> tuple:
     scene.frame_start = 1
     scene.frame_end = max(steps, 2)
     scene.frame_set(1)
-    return len(made), [act.name for act, _slot, _n in made]
+    return len(made), [act.name for act, _slot, _n in made], notes
 
 
 def _load_skeleton(folder: str) -> list:
@@ -818,9 +842,9 @@ class EXMT_OT_import_workspace(Operator):
                     slot.material = mat
 
         # 动作参考：每个导出到 animations/ 的片段做成一个 Action，挂到这副骨架上
-        anims, anim_names = 0, []
+        anims, anim_names, anim_notes = 0, [], {}
         if armature is not None and manifest.get("animations"):
-            anims, anim_names = _animation_actions(folder, armature, bones, label)
+            anims, anim_names, anim_notes = _animation_actions(folder, armature, bones, label)
 
         # one blueprint per import; its object nodes are pre-wired to the imported
         # meshes, so 「生成 Mod」 works immediately and you only re-wire what you swap
@@ -846,6 +870,13 @@ class EXMT_OT_import_workspace(Operator):
                        ("，清掉 %d 个被替换的旧网格" % dropped) if dropped else ""))
         if anims:
             self.report({"INFO"}, "动作已挂在这副骨架上：%s" % "、".join(anim_names[:4]))
+        # 动作和骨架的匹配度必须说出来：动作是按角色做的，骨架是"你勾了哪些网格"的并集
+        for clip, ratio in (anim_notes.get("skipped") or [])[:3]:
+            self.report({"WARNING"}, "跳过动作「%s」：这副骨架只匹配 %s 根骨，套上去只会变形"
+                        % (clip, ratio))
+        for clip, matched, animated in (anim_notes.get("partial") or [])[:3]:
+            self.report({"WARNING"}, "动作「%s」只匹配 %d/%d 根骨，动作会显示不全（多勾几个网格再导出可补齐）"
+                        % (clip, matched, animated))
         return {"FINISHED"}
 
 
