@@ -1,7 +1,7 @@
 bl_info = {
     "name": "EXMT Modbox Bridge",
     "author": "EXMT",
-    "version": (0, 6, 0),
+    "version": (0, 7, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > EXMT",
     "description": "Import the workspace selected in EXMT Modbox, edit or replace meshes and textures in a blueprint, then pack them back into bundles",
@@ -9,6 +9,7 @@ bl_info = {
 }
 
 import json
+import math
 import os
 import re
 import subprocess
@@ -27,6 +28,7 @@ from bpy.props import (
 )
 from bpy.types import AddonPreferences, Node, NodeSocket, NodeTree, Operator, Panel
 from bpy.utils import register_class, unregister_class
+from mathutils import Matrix, Quaternion, Vector
 
 try:
     from . import blueprint
@@ -446,6 +448,223 @@ def _textured_material(name: str, tex_paths: list, part: str):
     return mat
 
 
+# --------------------------------------------------------------------------- #
+# animations: the workspace's reference clips -> one Action each
+# --------------------------------------------------------------------------- #
+def _m4(values: list) -> Matrix:
+    """`skeleton.json` / clip data store a 4x4 row-major (same as mesh_io)."""
+    return Matrix([[float(values[r * 4 + c]) for c in range(4)] for r in range(4)])
+
+
+def _order_bones(parent: list) -> list:
+    """Parents before children, cycle-safe."""
+    order, state = [], {}
+
+    def visit(index: int, depth: int = 0) -> None:
+        if state.get(index) == 2 or depth > len(parent) + 2:
+            return
+        if state.get(index) == 1:          # cycle: treat as root, stop recursing
+            return
+        state[index] = 1
+        p = parent[index] if 0 <= index < len(parent) else -1
+        if 0 <= p < len(parent) and p != index:
+            visit(p, depth + 1)
+        state[index] = 2
+        order.append(index)
+
+    for i in range(len(parent)):
+        visit(i)
+    return order
+
+
+def _animation_actions(folder: str, rig, bones: list, label: str) -> tuple:
+    """Turn `animations/*.exmtanim` into Actions on `rig`; `(count, names)`.
+
+    The clip stores **local** TRS per bone plus the hash of its parent — the
+    hierarchy is nowhere in the clip itself, the core reads it from the character
+    prefab in the same bundle.  A pose is composed the way Unity does it,
+    `W(bone) = W(parent) · L(bone)`, with non-animated bones contributing their
+    rest local.  Blender wants a pose *basis*, which is
+    `(W(parent) · parent_rest⁻¹ · bone_rest)⁻¹ · W(bone)`; that is exact even where
+    this workspace's rig has a different (partly inferred) parent chain.
+    """
+    manifest = _manifest(folder)
+    rows = manifest.get("animations") or []
+    if not rig or not bones or not rows:
+        return 0, []
+    by_hash = {int(b.get("hash") or 0): i for i, b in enumerate(bones)}
+    rest = [
+        _m4(b.get("rest") or (1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1))
+        for b in bones
+    ]
+    bl_bones = [rig.data.bones.get(b.get("name") or "") for b in bones]
+    # index of each bone's *Blender* parent, and Blender's own rest relationship
+    bl_parent = []
+    for bone in bl_bones:
+        parent = bone.parent if bone is not None else None
+        bl_parent.append(next((j for j, other in enumerate(bl_bones) if other == parent), -1)
+                         if parent is not None else -1)
+    # rest relationship in Blender's own armature (parent rest)⁻¹ · bone rest
+    offset = []
+    for i, bone in enumerate(bl_bones):
+        if bone is not None and bone.parent is not None:
+            offset.append(bone.parent.matrix_local.inverted() @ bone.matrix_local)
+        else:
+            offset.append((rest[i] if bone is None else bone.matrix_local))
+
+    here = os.path.abspath(folder)
+    # a re-import replaces this workspace's actions instead of piling up `.001`
+    for old in list(bpy.data.actions):
+        if old.get("exmt_workspace") == here:
+            bpy.data.actions.remove(old)
+
+    made = []
+    for row in rows:
+        rel = row.get("file") or ""
+        path = os.path.join(folder, rel)
+        if not rel or not os.path.isfile(path):
+            continue
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except Exception:
+            continue
+        times = data.get("times") or []
+        steps = len(times)
+        if steps < 2:
+            continue
+        tracks = {}
+        for track in data.get("bones") or []:
+            index = by_hash.get(int(track.get("hash") or 0))
+            if index is not None:
+                tracks[index] = track
+        if not tracks:
+            continue
+        # the clip's own hierarchy wins; fall back to the skeleton's parent index
+        parent = []
+        for i, bone in enumerate(bones):
+            track = tracks.get(i)
+            p = by_hash.get(int(track.get("parent") or 0)) if track else None
+            if p is None or p == i:
+                guess = bone.get("parent", -1)
+                p = guess if isinstance(guess, int) else -1
+            parent.append(p if isinstance(p, int) and 0 <= p < len(bones) and p != i else -1)
+        order = _order_bones(parent)
+        local_rest = [
+            (rest[parent[i]].inverted() @ rest[i]) if parent[i] >= 0 else rest[i]
+            for i in range(len(bones))
+        ]
+
+        def sample(track, key, count, step, fallback):
+            rows_ = track.get(key) if track else None
+            if not rows_:
+                return list(fallback)
+            return [float(rows_[c][step]) for c in range(count)]
+
+        channels = {i: {"location": [], "rotation_quaternion": [], "scale": []}
+                    for i in tracks}
+        for step in range(steps):
+            world = {}
+            for i in order:
+                base = local_rest[i]
+                track = tracks.get(i)
+                if track:
+                    pos = sample(track, "position", 3, step, base.to_translation())
+                    if track.get("rotation"):
+                        quat = sample(track, "rotation", 4, step, base.to_quaternion())
+                        rot = Quaternion((quat[3], quat[0], quat[1], quat[2])).to_matrix()
+                    elif track.get("euler"):
+                        # Unity stores `localEulerAnglesRaw` in degrees and applies
+                        # Z, then X, then Y — the curves and the quaternions are
+                        # never both present on one transform (checked: 0 of 258)
+                        ex, ey, ez = (math.radians(v) for v in sample(track, "euler", 3, step, (0.0, 0.0, 0.0)))
+                        rot = (Matrix.Rotation(ey, 3, "Y") @ Matrix.Rotation(ex, 3, "X")
+                               @ Matrix.Rotation(ez, 3, "Z"))
+                    else:
+                        rot = base.to_3x3()
+                    scale = sample(track, "scale", 3, step, base.to_scale())
+                    local = (Matrix.Translation(Vector(pos))
+                             @ rot.to_4x4()
+                             @ Matrix.Diagonal(Vector(scale).to_4d()))
+                else:
+                    local = base
+                world[i] = (world[parent[i]] @ local) if parent[i] >= 0 else local
+            for i in tracks:
+                bone = bl_bones[i]
+                if bone is None:
+                    continue
+                # Blender's own parent chain decides the rest offset, so the parent
+                # world must come from *that* chain too (the clip's chain can differ
+                # where the skeleton's parents were only inferred)
+                blp = bl_parent[i]
+                parent_world = (world[blp] if blp in world else rest[blp]) if blp >= 0 else Matrix.Identity(4)
+                base_world = parent_world @ offset[i] if blp >= 0 else offset[i]
+                basis = base_world.inverted() @ world[i]
+                loc, quat, scale = basis.decompose()
+                row = channels[i]
+                row["location"].extend((float(step + 1), loc.x, loc.y, loc.z))
+                row["rotation_quaternion"].extend(
+                    (float(step + 1), quat.w, quat.x, quat.y, quat.z))
+                row["scale"].extend((float(step + 1), scale.x, scale.y, scale.z))
+
+        name = row.get("clip") or os.path.splitext(os.path.basename(rel))[0]
+        action = bpy.data.actions.new(name)
+        action.use_fake_user = True
+        # which workspace/clip it came from: re-import and overlap checks read this
+        action["exmt_workspace"] = here
+        action["exmt_clip"] = row.get("clip") or name
+        slot = action.slots.new(id_type="OBJECT", name=name[:63])
+        strip = action.layers.new("Layer").strips.new(type="KEYFRAME")
+        bag = strip.channelbag(slot, ensure=True)
+        widths = {"location": 3, "rotation_quaternion": 4, "scale": 3}
+        for i, row in channels.items():
+            bone_name = (bones[i].get("name") or "").replace('"', "")
+            for key, width in widths.items():
+                flat = row[key]
+                if not flat:
+                    continue
+                for axis in range(width):
+                    curve = bag.fcurves.new('pose.bones["%s"].%s' % (bone_name, key), index=axis)
+                    points = [(flat[k], flat[k + 1 + axis]) for k in range(0, len(flat), width + 1)]
+                    curve.keyframe_points.add(len(points))
+                    co = [value for point in points for value in point]
+                    curve.keyframe_points.foreach_set("co", co)
+                    curve.update()
+        action.use_frame_range = True
+        action.frame_start = 1.0
+        action.frame_end = float(steps)
+        # keep them selectable in the Action editor, and push each onto its own
+        # muted NLA track so switching clips is one click
+        rig.animation_data_create()
+        try:
+            track = rig.animation_data.nla_tracks.new()
+            track.name = name
+            nla = track.strips.new(name, 1, action)
+            try:
+                nla.action_slot = slot
+            except Exception:
+                pass
+            track.mute = True
+        except Exception:
+            pass
+        made.append((action, slot, steps))
+
+    if not made:
+        return 0, []
+    # the first clip is live, so the user sees motion immediately
+    action, slot, steps = made[0]
+    rig.animation_data.action = action
+    try:
+        rig.animation_data.action_slot = slot
+    except Exception:
+        pass
+    scene = bpy.context.scene
+    scene.frame_start = 1
+    scene.frame_end = max(steps, 2)
+    scene.frame_set(1)
+    return len(made), [act.name for act, _slot, _n in made]
+
+
 def _load_skeleton(folder: str) -> list:
     """Bones of `skeleton.json` (the union of every mesh's table), or []."""
     path = os.path.join(folder, "skeleton.json")
@@ -598,6 +817,11 @@ class EXMT_OT_import_workspace(Operator):
                 for slot in obj.material_slots:
                     slot.material = mat
 
+        # 动作参考：每个导出到 animations/ 的片段做成一个 Action，挂到这副骨架上
+        anims, anim_names = 0, []
+        if armature is not None and manifest.get("animations"):
+            anims, anim_names = _animation_actions(folder, armature, bones, label)
+
         # one blueprint per import; its object nodes are pre-wired to the imported
         # meshes, so 「生成 Mod」 works immediately and you only re-wire what you swap
         tree = blueprint.new_blueprint(folder, label)
@@ -614,12 +838,14 @@ class EXMT_OT_import_workspace(Operator):
                                      "回 App 重新点一次「开始制作」即可拿到完整骨架"
                         % (len(imported), len(tex_paths), label))
             return {"FINISHED"}
-        self.report({"INFO"}, "导入 %d 个网格 · %d 张贴图 · %d 根骨骼 · %s · 集合「%s」 · 蓝图「%s」%s"
+        self.report({"INFO"}, "导入 %d 个网格 · %d 张贴图 · %d 根骨骼 · %d 个动作 · %s · 集合「%s」 · 蓝图「%s」%s"
                               "（%d 个物体 + %d 个贴图节点，Frame「%s」%s）"
-                    % (len(imported), len(tex_paths), len(bones), label,
+                    % (len(imported), len(tex_paths), len(bones), anims, label,
                        collection.name, tree.name, reused, wired["wired"], wired["textures"],
                        wired["frame"],
                        ("，清掉 %d 个被替换的旧网格" % dropped) if dropped else ""))
+        if anims:
+            self.report({"INFO"}, "动作已挂在这副骨架上：%s" % "、".join(anim_names[:4]))
         return {"FINISHED"}
 
 
