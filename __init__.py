@@ -1,7 +1,7 @@
 bl_info = {
     "name": "EXMT Modbox Bridge",
     "author": "EXMT",
-    "version": (0, 7, 0),
+    "version": (0, 7, 1),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > EXMT",
     "description": "Import the workspace selected in EXMT Modbox, edit or replace meshes and textures in a blueprint, then pack them back into bundles",
@@ -405,20 +405,31 @@ def _image(path: str, non_color: bool = False):
     return img
 
 
-def _textured_material(name: str, tex_paths: list, part: str):
-    """Principled material from the workspace PNGs (base colour + normal map)."""
+def _textured_material(name: str, tex_paths: list, part: str, wanted=None):
+    """Principled material from the workspace PNGs (base colour + normal map).
 
-    def pick(suffixes):
+    `wanted` is the workspace's `groups[mesh]` list: the exact textures the core
+    paired with this submesh.  It wins over name guessing, which used to give the
+    body a cloth atlas and the head mesh a hair-only material.
+    """
+    wanted_stems = {os.path.splitext(os.path.basename(item))[0] for item in (wanted or [])}
+
+    def pick(suffixes, require_part=True):
         for path in tex_paths:
             stem = os.path.splitext(os.path.basename(path))[0]
-            if part and ("_%s" % part) not in stem:
+            if wanted_stems:
+                if stem not in wanted_stems:
+                    continue
+                if require_part and part and ("_%s" % part) not in stem:
+                    continue
+            elif part and ("_%s" % part) not in stem:
                 continue
             if any(stem.endswith(s) for s in suffixes):
                 return path
         return None
 
-    base = pick(("_d", "_d1", "_da"))
-    normal = pick(("_n",))
+    base = pick(("_d", "_d1", "_da", "_bt")) or pick(("_d", "_d1", "_da", "_bt"), False)
+    normal = pick(("_n", "_nt")) or pick(("_n", "_nt"), False)
     if base is None and normal is None:
         return None
 
@@ -828,6 +839,7 @@ class EXMT_OT_import_workspace(Operator):
             _link(collection, armature)
 
         imported = {}
+        groups = manifest.get("groups") or {}
         for item in manifest.get("meshes", []):
             path = os.path.join(folder, item["file"])
             if not os.path.isfile(path):
@@ -836,7 +848,12 @@ class EXMT_OT_import_workspace(Operator):
             imported[item.get("mesh", "")] = obj
             _link(collection, obj)
 
-            mat = _textured_material(obj.name + "_mat", tex_paths, _part_of(item.get("mesh", "")))
+            mat = _textured_material(
+                obj.name + "_mat",
+                tex_paths,
+                _part_of(item.get("mesh", "")),
+                groups.get(item.get("mesh", "")),
+            )
             if mat is not None:
                 for slot in obj.material_slots:
                     slot.material = mat
