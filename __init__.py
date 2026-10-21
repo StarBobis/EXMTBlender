@@ -1,10 +1,10 @@
 bl_info = {
     "name": "EXMT Modbox Bridge",
     "author": "EXMT",
-    "version": (0, 7, 2),
+    "version": (0, 8, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > EXMT",
-    "description": "Import the workspace selected in EXMT Modbox, edit or replace meshes and textures in a blueprint, then pack them back into bundles",
+    "description": "Import the workspace selected in EXMT Modbox, edit or replace meshes and textures in a blueprint, export the job to GeneratedMod, and let EXMT encode and pack it",
     "category": "Import-Export",
 }
 
@@ -12,21 +12,11 @@ import json
 import math
 import os
 import re
-import subprocess
-import sys
-import tempfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
 
 import bpy
-from bpy.props import (
-    BoolProperty,
-    EnumProperty,
-    FloatProperty,
-    IntProperty,
-    PointerProperty,
-    StringProperty,
-)
-from bpy.types import AddonPreferences, Node, NodeSocket, NodeTree, Operator, Panel
+from bpy.props import BoolProperty, FloatProperty, StringProperty
+from bpy.types import AddonPreferences, Operator, Panel
 from bpy.utils import register_class, unregister_class
 from mathutils import Matrix, Quaternion, Vector
 
@@ -37,8 +27,6 @@ except ImportError:  # loaded as a plain module (headless helpers)
     import blueprint  # type: ignore
     import mesh_io  # type: ignore
 
-DEFAULT_CORE = r"C:\Dev\EXMT\core"
-DEFAULT_PYTHON = r"C:\Users\Administrator\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\python\python.exe"
 DEFAULT_WORKSPACE = r"C:\EXMTCacheFolder\workspace"
 _APPDATA = os.environ.get("APPDATA", "")
 DEFAULT_CONFIG = (
@@ -51,67 +39,6 @@ def _prefs():
         return bpy.context.preferences.addons[__name__.split(".")[0]].preferences
     except Exception:
         return None
-
-
-def _core_dir() -> str:
-    p = _prefs()
-    return p.core_dir if p and p.core_dir else DEFAULT_CORE
-
-
-def _python_exe() -> str:
-    p = _prefs()
-    return p.python_exe if p and p.python_exe else DEFAULT_PYTHON
-
-
-def run_core(args: list, timeout: int = 300) -> dict:
-    """Run `python -m exmt_core ...` with the configured interpreter."""
-    env = dict(os.environ)
-    env["PYTHONPATH"] = _core_dir() + os.pathsep + env.get("PYTHONPATH", "")
-    proc = subprocess.run(
-        [_python_exe(), "-m", "exmt_core", *args],
-        cwd=_core_dir(), env=env, capture_output=True, text=True, timeout=timeout,
-    )
-    if proc.returncode != 0:
-        raise RuntimeError((proc.stderr or proc.stdout or "").strip()[-2000:])
-    return {"stdout": proc.stdout, "stderr": proc.stderr}
-
-
-def target_bone_table(bundle: str, mesh_name: str) -> list:
-    """Bones of the game mesh an external object is about to replace.
-
-    The app writes the path of its bone-name index into `EXMTConfig.json`; with
-    it the table carries the same names the workspace used, so an external mesh
-    whose weights came from a transfer can be matched by name.
-    """
-    index = ""
-    cfg, _path = _read_config()
-    if isinstance(cfg, dict):
-        index = str(cfg.get("bone_names") or "")
-    args = ["bonetable", bundle, mesh_name]
-    if index and os.path.isfile(index):
-        args.append(index)
-    try:
-        res = run_core(args, timeout=120)
-        payload = json.loads(res["stdout"].strip().splitlines()[-1])
-        return payload.get("bones") or []
-    except Exception:
-        return []
-
-
-def target_material_slots(bundle: str, mesh_name: str) -> int:
-    """How many materials the game mesh carries — i.e. how many submeshes survive.
-
-    The renderer's material list belongs to the mesh being replaced, so a foreign
-    model's slot 5..19 hit nothing and Unity skips those submeshes entirely: the
-    parts are invisible in game while Blender still renders them (measured
-    2026-10-19: Sally's 20-slot PMX over GF2's 4-slot cloth lost 6803 of 14568
-    faces — both forearms and both hands).
-    """
-    try:
-        res = run_core(["matinfo", bundle, mesh_name], timeout=120)
-        return int(json.loads(res["stdout"].strip().splitlines()[-1]).get("submeshes") or 0)
-    except Exception:
-        return 0
 
 
 def _report_export(operator, info: dict) -> None:
@@ -252,74 +179,6 @@ class EXMT_OT_transfer_weights(Operator):
                 self.source = o.name
                 break
         return context.window_manager.invoke_props_dialog(self)
-
-
-class EXMT_OT_extract_bundle(Operator):
-    bl_idname = "exmt.extract_bundle"
-    bl_label = "从 Bundle 提取并导入"
-    bl_options = {"REGISTER", "UNDO"}
-
-    bundle: StringProperty(name="Bundle", subtype="FILE_PATH")
-    mesh_name: StringProperty(name="Mesh 名称")
-    import_after: BoolProperty(name="导入到场景", default=True)
-
-    def execute(self, context):
-        out = os.path.join(bpy.app.tempdir, "exmt_extract.exmtmesh")
-        run_core(["extract", self.bundle, self.mesh_name, out])
-        if self.import_after:
-            mesh_io.import_mesh(out)
-        self.report({"INFO"}, "已提取 %s" % self.mesh_name)
-        return {"FINISHED"}
-
-
-class EXMT_OT_pack_bundle(Operator):
-    bl_idname = "exmt.pack_bundle"
-    bl_label = "打包回 Bundle"
-    bl_options = {"REGISTER"}
-
-    bundle: StringProperty(name="源 Bundle", subtype="FILE_PATH")
-    mesh_name: StringProperty(name="Mesh 名称")
-    mesh_file: StringProperty(name=".exmtmesh", subtype="FILE_PATH")
-    output: StringProperty(name="输出 Bundle", subtype="FILE_PATH")
-
-    def execute(self, context):
-        res = run_core(["pack", self.bundle, self.mesh_name, self.mesh_file, self.output])
-        self.report({"INFO"}, res["stdout"].strip().splitlines()[-1])
-        return {"FINISHED"}
-
-
-class EXMT_OT_export_and_pack(Operator):
-    bl_idname = "exmt.export_and_pack"
-    bl_label = "一键导出并打包"
-    bl_options = {"REGISTER"}
-
-    bundle: StringProperty(name="源 Bundle", subtype="FILE_PATH")
-    mesh_name: StringProperty(name="Mesh 名称")
-    output: StringProperty(name="输出 Bundle", subtype="FILE_PATH")
-
-    def execute(self, context):
-        obj = context.active_object
-        if obj is None or obj.type != "MESH":
-            self.report({"ERROR"}, "先选中一个网格物体")
-            return {"CANCELLED"}
-        tmp = os.path.join(bpy.app.tempdir, "exmt_pack.exmtmesh")
-        # a foreign mesh has no bone table of its own: weights are matched by bone
-        # name against the game mesh it replaces.  A mesh with no skinning at all
-        # (a static prop / weapon attachment) must not borrow that table.
-        skinned = mesh_io.has_skin(obj)
-        table = None
-        if skinned and not obj.get("exmt_bones"):
-            table = target_bone_table(self.bundle, self.mesh_name)
-        info = mesh_io.export_mesh(obj, tmp, {"name": self.mesh_name},
-                                   bone_table=table, skinned=skinned)
-        run_core(["pack", self.bundle, self.mesh_name, tmp, self.output])
-        msg = "已打包 %s（%d 顶点）" % (os.path.basename(self.output), info["verts"])
-        dropped = int(info.get("dropped_influences") or 0)
-        if dropped:
-            self.report({"WARNING"}, msg + "；%d 个权重不属于该网格的骨骼，已忽略" % dropped)
-        else:
-            self.report({"INFO"}, msg)
-        return {"FINISHED"}
 
 
 # --------------------------------------------------------------------------- #
@@ -945,39 +804,30 @@ def _link(collection, obj) -> None:
 
 
 def _cache_texture_meta(tree, folder: str, manifest: dict) -> dict:
-    """Ask the core what each texture expects (size / format / mips) and cache it.
+    """Cache what `workspace.json` already says about each texture.
 
-    One call per bundle: a texture bundle can hold hundreds of Texture2Ds and
-    opening it once is the difference between "instant" and "half a minute".
+    The app writes format / width / height / mips at export time, so the node
+    editor can label every texture without opening a bundle.  A workspace
+    exported by an older build only carries width/height; the label then shows
+    `?` for the format, and EXMT still reads the real format from the bundle
+    when it encodes the replacement.
     """
-    grouped = {}
-    for item in manifest.get("textures", []):
-        grouped.setdefault(item.get("bundle", ""), []).append(item.get("name", ""))
-    bundles = manifest.get("bundles") or {}
-    if not bundles:
-        spec_path = os.path.join(folder, "spec.json")
-        if os.path.isfile(spec_path):
-            with open(spec_path, encoding="utf-8") as fh:
-                bundles = (json.load(fh) or {}).get("bundles") or {}
     meta = {}
-    for hash_, names in grouped.items():
-        path = bundles.get(hash_)
-        if not path or not os.path.isfile(path):
+    for item in manifest.get("textures", []):
+        name = item.get("name", "")
+        if not name:
             continue
-        try:
-            res = run_core(["texinfo", path], timeout=300)
-            rows = json.loads(res["stdout"].strip().splitlines()[-1])
-        except Exception:
-            continue
-        wanted = set(names)
-        for row in rows:
-            if row.get("name") in wanted:
-                meta[row["name"]] = {
-                    "width": row.get("width"), "height": row.get("height"),
-                    "mips": row.get("mips"), "format": row.get("format"),
-                    "format_name": row.get("format_name"),
-                    "supported": row.get("supported"), "bundle": hash_,
-                }
+        info = {
+            "bundle": item.get("bundle", ""),
+            "supported": True,
+            "format_name": item.get("format_name") or "",
+        }
+        # Older workspaces only recorded width/height; omitting the missing keys
+        # keeps `texture_rows` from overwriting the manifest values with None.
+        for key in ("width", "height", "mips", "format"):
+            if item.get(key) is not None:
+                info[key] = item[key]
+        meta[name] = info
     tree.texture_meta = json.dumps(meta, ensure_ascii=False)
     return meta
 
@@ -1187,427 +1037,138 @@ def _prewire_blueprint(tree, imported: dict, folder: str, label: str) -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# panel
+# generate Mod: Blender writes the intermediate job, EXMT packs it
 # --------------------------------------------------------------------------- #
+def _save_png(image, path: str) -> None:
+    """Write one Blender image as a PNG on disk, keeping the datablock's path."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    original_path = image.filepath_raw
+    original_format = image.file_format
+    try:
+        image.filepath_raw = path
+        image.file_format = "PNG"
+        try:
+            image.save()
+        except Exception:
+            # packed or generated images have no file on disk yet
+            image.save_render(path)
+    finally:
+        image.filepath_raw = original_path
+        image.file_format = original_format
+    if not os.path.isfile(path):
+        raise RuntimeError("无法写出贴图：%s" % path)
+
+
+def _relative(path: str, root: str) -> str:
+    """Workspace-relative path with forward slashes, so job.json is portable."""
+    try:
+        return os.path.relpath(path, root).replace("\\", "/")
+    except ValueError:
+        return path.replace("\\", "/")
+
+
+def _safe_stem(name: str) -> str:
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", name or "")[:96]
+    return stem or "texture"
+
+
+def _remove(path: str) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _texture_bundles(manifest: dict, name: str) -> list:
+    """Every bundle that stores this texture, from the workspace's own index."""
+    found = [h for h in (manifest.get("texture_bundles") or {}).get(name, []) if h]
+    if found:
+        return found
+    for row in manifest.get("textures", []):
+        if row.get("name") == name and row.get("bundle"):
+            return [row["bundle"]]
+    return []
+
+
 class EXMT_OT_generate_mod(Operator):
     bl_idname = "exmt.generate_mod"
-    bl_label = "生成 Mod（打包到工作空间）"
-    bl_description = "把所有蓝图里连到「生成 Mod」节点的物体按 Submesh 打包，输出到 <工作空间>/GeneratedMod"
+    bl_label = "生成 Mod（导出到工作空间）"
+    bl_description = ("把蓝图里连到「生成 Mod」节点的物体和贴图导出到 <工作空间>/GeneratedMod；"
+                      "贴图编码和打包由 EXMT 完成，回到 App 点「加载到游戏」即可")
     bl_options = {"REGISTER"}
 
     workspace: StringProperty(name="工作空间目录", default="")
     #: only pack this blueprint (the generate node's own button sets it)
     blueprint: StringProperty(name="蓝图", default="")
 
-    # -- setup ------------------------------------------------------------- #
     def _prepare(self, context) -> str:
-        """Resolve the workspace and start a `Generation`.  Returns an error text."""
+        """Resolve the workspace and run the export.  Returns an error text."""
         info, _source = _active_workspace_info()
         info = info or {}
         folder = self.workspace or info.get("dir") or ""
-        self.label = info.get("label") or ""
+        label = info.get("label") or ""
         if not folder or not os.path.isfile(os.path.join(folder, "workspace.json")):
             return "没有可用的工作空间；先在 App 模型页选一个并点「一键导入当前工作空间」"
         tree = bpy.data.node_groups.get(self.blueprint) if self.blueprint else None
         if tree is None:
             tree = getattr(context.scene, "exmt_blueprint", None)
-        self._window = getattr(context, "window_manager", None)
-        self._pushed = False
-        self._timer = None
         try:
-            self._run = Generation(folder, self.label, tree=tree, progress=self._progress,
-                                   report=self.report).start()
+            self._run = Generation(folder, label, tree=tree, report=self.report).start()
         except Exception as exc:  # noqa: BLE001 - surface the core's message
             self._run = None
             return str(exc)[:300]
         return ""
 
-    def invoke(self, context, event):
-        """Drive the run from a timer so the window keeps drawing while it works.
-
-        Texture encoding is texconv work (measured 5 s for one 2048² BC7 texture)
-        plus a core `modpack` pass; run straight through, that is a minute of a
-        frozen window with no feedback.  Here each texture lands in its own timer
-        tick: the progress bar moves, the status bar names the texture, Esc cancels.
-        """
-        error = self._prepare(context)
-        if error:
-            self.report({"ERROR"}, error)
-            return {"CANCELLED"}
-        if getattr(context, "window", None) is None:
-            return self._finish_sync(context)          # headless: no event loop
-        self._status(context, "EXMT 正在生成 Mod…")
-        context.window_manager.modal_handler_add(self)
-        self._timer = context.window_manager.event_timer_add(0.05, window=context.window)
-        return {"RUNNING_MODAL"}
-
     def execute(self, context):
-        """Panel/script path: run the same steps without the modal loop."""
         error = self._prepare(context)
         if error:
             self.report({"ERROR"}, error)
             return {"CANCELLED"}
-        return self._finish_sync(context)
+        return self._report(self._run.summary or {})
 
-    def _finish_sync(self, context):
-        try:
-            while not self._run.step():
-                pass
-        except Exception as exc:  # noqa: BLE001
-            self._cleanup(context)
-            self.report({"ERROR"}, str(exc)[:300])
-            return {"CANCELLED"}
-        summary = self._run.summary or {}
-        self._cleanup(context)
-        return self._report(summary)
+    def invoke(self, context, event):
+        """Export straight away: there is no texture encoding left to yield to.
 
-    # -- progress / teardown ------------------------------------------------ #
-    def _progress(self, done, total, name):
-        window = getattr(self, "_window", None)
-        if window is None:
-            return
-        total = max(1, total)
-        if not getattr(self, "_pushed", False):
-            window.progress_begin(0, total)
-            self._pushed = True
-        window.progress_update(min(done, total))
-        text = "编码贴图 %d/%d %s" % (min(done + 1, total), total,
-                                     (name or "").replace("c_AlvaSSR0102_slg_", ""))
-        self._status(bpy.context, "EXMT 正在%s" % text)
-        self._node_progress(text)
-
-    def _node_progress(self, text):
-        """Draw the progress on the generate node too, and repaint the editor.
-
-        The modal operator yields between textures, so a node label update is what
-        the user actually sees moving (the status bar is a 20 px strip).
+        The old modal loop existed because texconv ran for a minute and the
+        window had to keep drawing.  EXMT does that work now, so the operator
+        is a plain synchronous export of meshes and PNGs.
         """
-        run = getattr(self, "_run", None)
-        if run is None:
-            return
-        for node in run.generate_nodes:
-            try:
-                node.progress_text = text
-            except Exception:
-                pass
-        for window in getattr(bpy.context.window_manager, "windows", []):
-            for area in window.screen.areas:
-                if area.type == "NODE_EDITOR":
-                    area.tag_redraw()
-
-    def _status(self, context, text):
-        try:
-            context.workspace.status_text_set(text)
-        except Exception:
-            pass
-
-    def _cleanup(self, context):
-        window = getattr(self, "_window", None)
-        run = getattr(self, "_run", None)
-        if run is not None:
-            for node in run.generate_nodes:
-                try:
-                    node.progress_text = ""
-                except Exception:
-                    pass
-        if window is not None and getattr(self, "_pushed", False):
-            try:
-                window.progress_end()
-            except Exception:
-                pass
-            self._pushed = False
-        if getattr(self, "_timer", None) is not None and window is not None:
-            try:
-                window.event_timer_remove(self._timer)
-            except Exception:
-                pass
-            self._timer = None
-        self._status(context, None)
-        run = getattr(self, "_run", None)
-        if run is not None:
-            run.close()
-
-    def modal(self, context, event):
-        if event.type in {"ESC", "RIGHTMOUSE"}:
-            self._cleanup(context)
-            self.report({"WARNING"}, "已取消生成 Mod")
-            return {"CANCELLED"}
-        if event.type != "TIMER":
-            return {"PASS_THROUGH"}
-        try:
-            finished = self._run.step()
-        except Exception as exc:  # noqa: BLE001
-            self._cleanup(context)
-            self.report({"ERROR"}, str(exc)[:300])
-            return {"CANCELLED"}
-        if not finished:
-            return {"RUNNING_MODAL"}
-        summary = self._run.summary or {}
-        self._cleanup(context)
-        return self._report(summary)
+        return self.execute(context)
 
     def _report(self, summary):
-        msg = "生成 Mod：%d 个 Submesh → %d 个包（%s）" % (
-            summary.get("packed", summary.get("meshes", 0)), summary.get("bundles", 0),
-            summary.get("dir", ""))
-        if summary.get("packed_textures"):
-            msg += " · %d 张贴图（新编码 %d）" % (
-                summary["packed_textures"], summary.get("encoded_textures", 0))
+        msg = "已导出 %d 个 Submesh · %d 张贴图 → %s" % (
+            summary.get("meshes", 0), summary.get("textures", 0), summary.get("dir", ""))
+        msg += "；到 EXMT 点「加载到游戏」完成编码与打包"
+        notes = list(summary.get("warnings") or [])
         skipped_tex = summary.get("skipped_textures") or []
         if skipped_tex:
-            msg += "；未替换：%s" % "、".join(skipped_tex[:3]) + ("…" if len(skipped_tex) > 3 else "")
+            notes.append("未替换：%s" % "、".join(skipped_tex[:3]) +
+                         ("…" if len(skipped_tex) > 3 else ""))
         skipped = summary.get("skipped") or []
         if skipped:
-            msg += "；未连接的槽位：%s" % "、".join(skipped[:4]) + (
-                "…" if len(skipped) > 4 else "")
-        if summary.get("missing"):
-            self.report({"WARNING"}, msg + "；%d 项缺文件" % len(summary["missing"]))
+            notes.append("未连接的槽位：%s" % "、".join(skipped[:4]) +
+                         ("…" if len(skipped) > 4 else ""))
+        if notes:
+            self.report({"WARNING"}, msg + "；" + "；".join(notes[:3]))
         else:
             self.report({"INFO"}, msg)
         return {"FINISHED"}
 
 
-def _texconv() -> str:
-    """The bundled texconv.exe (BC7/BC1/…), with an env override for other installs."""
-    override = os.environ.get("EXMT_TEXCONV", "")
-    if override and os.path.isfile(override):
-        return override
-    here = os.path.dirname(os.path.abspath(__file__))
-    for name in ("texconv.exe", "texconv"):
-        path = os.path.join(here, "bin", name)
-        if os.path.isfile(path):
-            return path
-    raise RuntimeError("找不到 texconv.exe：应该在 %s\\bin\\texconv.exe" % here)
-
-
-def _core_module(name: str):
-    """Import a module of the Python core inside Blender.
-
-    Blender's bundled Python has numpy but neither UnityPy nor lz4, so the core
-    package (`exmt_core/__init__`) cannot be imported here. The modules that are
-    dependency-free (`ddsinfo`) are loaded straight from their file instead.
-    """
-    import importlib.util
-
-    path = os.path.join(_core_dir(), "exmt_core", name + ".py")
-    if not os.path.isfile(path):
-        raise RuntimeError("找不到核心模块：%s" % path)
-    spec = importlib.util.spec_from_file_location("exmt_" + name, path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-def _encode_texture(image_path: str, meta: dict, work_dir: str) -> bytes:
-    """Convert a replacement image into the target's own format, size and mips.
-
-    `-srgbi -srgbo` is an identity transform on the pixel values, which is what we
-    want: the numbers in the PNG are the numbers that must end up in the asset.
-    Without it texconv treats a Blender-written PNG as sRGB and writes *linear*
-    blocks (measured: 31 → 4, 219 → 181, i.e. everything much darker).
-    """
-    os.makedirs(work_dir, exist_ok=True)
-    cmd = [_texconv(),
-           "-f", meta["format_name"],
-           "-w", str(meta["width"]), "-h", str(meta["height"]),
-           "-m", str(meta.get("mips") or 1),
-           "-srgbi", "-srgbo",
-           "-ft", "dds", "-o", work_dir, "-y", "-nologo", image_path]
-    res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
-                         errors="replace", timeout=600)
-    stem = os.path.splitext(os.path.basename(image_path))[0]
-    dds = os.path.join(work_dir, stem + ".dds")
-    if not os.path.isfile(dds):
-        raise RuntimeError("texconv 没有输出 DDS：%s" % (res.stdout + res.stderr)[-300:])
-    return _core_module("ddsinfo").parse_dds(dds)["payload"]
-
-
-def _texture_jobs(tree, folder: str, patchdir: str, meta: dict) -> tuple:
-    """Prepare (but do not encode) every texture node that has a replacement image.
-
-    Returns `(jobs, skipped)`.  Preparing writes the node's image out as a PNG on
-    the **main thread** (bpy image access is not thread-safe) and decides from the
-    cache whether the texture needs encoding at all:
-
-    * **cache**: unchanged source file + unchanged target → the `.bin` on disk is
-      reused, so a second 「生成 Mod」 encodes nothing;
-    * the actual texconv calls are pure subprocess work, so they run in a thread
-      pool (measured 5 s per 2048² BC7 texture, twelve of them in ~35 s instead of
-      ~60 s single-threaded).
-    """
-    skipped = []
-    nodes = [n for n in tree.nodes if n.bl_idname == "EXMTNodeTexture"]
-    pending = [n for n in nodes if n.image is not None]
-    work = os.path.join(bpy.app.tempdir or tempfile.gettempdir(), "exmt-tex")
-    ddsdir = os.path.join(work, "dds")
-    os.makedirs(ddsdir, exist_ok=True)
-
-    jobs = []
-    for node in pending:
-        info = meta.get(node.texture) or {}
-        if not info:
-            skipped.append("%s（本体里没有这张贴图）" % (node.texture or "?"))
-            continue
-        if not info.get("supported", True):
-            skipped.append("%s（格式 %s 不支持）" % (node.texture, info.get("format")))
-            continue
-        out = os.path.join(patchdir, (node.texture or "texture") + ".bin")
-        stamp = _image_stamp(node.image, info)
-        sidecar = out + ".json"
-        cached = bool(stamp and _cache_hit(sidecar, stamp) and os.path.isfile(out))
-        png = ""
-        if not cached:
-            png = os.path.join(work, (node.texture or "texture") + ".png")
-            image = node.image
-            # `image.save()` repoints `filepath_raw`; restore it so the user's
-            # datablock keeps its own path (and the cache key stays stable)
-            original_path = image.filepath_raw
-            original_format = image.file_format
-            try:
-                image.filepath_raw = png
-                image.file_format = "PNG"
-                try:
-                    image.save()
-                except Exception:
-                    # packed or generated images have no file on disk yet
-                    image.save_render(png)
-            finally:
-                image.filepath_raw = original_path
-                image.file_format = original_format
-        jobs.append({"node": node, "info": info, "out": out, "sidecar": sidecar,
-                     "stamp": stamp, "png": png, "cached": cached})
-
-    for node in nodes:
-        if node.image is None:
-            skipped.append(node.texture or "（未选贴图）")
-    return jobs, skipped
-
-
-def _encode_job(job: dict, ddsdir: str) -> None:
-    """Run one texconv job and write its `.bin` (+ cache sidecar). Thread-safe."""
-    payload = _encode_texture(job["png"], job["info"], ddsdir)
-    tmp = job["out"] + ".part"
-    with open(tmp, "wb") as fh:
-        fh.write(payload)
-    os.replace(tmp, job["out"])
-    if job["stamp"]:
-        with open(job["sidecar"], "w", encoding="utf-8") as fh:
-            json.dump(job["stamp"], fh, ensure_ascii=False)
-
-
-def _texture_rows(jobs: list, folder: str) -> list:
-    """One row per bundle that stores the texture (a name can live in several)."""
-    rows = []
-    for job in jobs:
-        info = job["info"]
-        name = job["node"].texture
-        for hash_ in (texture_bundles_of(name, info, folder) or [info.get("bundle", "")]):
-            if not hash_:
-                continue
-            rows.append({
-                "bundle": hash_,
-                "name": name,
-                "file": job["out"],
-                "format": info.get("format"),
-                "width": info.get("width"),
-                "height": info.get("height"),
-                "mips": info.get("mips"),
-            })
-    return rows
-
-
-def _texture_patches(tree, folder: str, patchdir: str, meta: dict, progress=None) -> tuple:
-    """Synchronous texture export: prepare, encode everything, build the rows."""
-    jobs, skipped = _texture_jobs(tree, folder, patchdir, meta)
-    todo = [job for job in jobs if not job["cached"]]
-    if todo:
-        ddsdir = os.path.join(bpy.app.tempdir or tempfile.gettempdir(), "exmt-tex", "dds")
-        os.makedirs(ddsdir, exist_ok=True)
-        done = 0
-        with ThreadPoolExecutor(max_workers=min(len(todo), 6)) as pool:
-            futures = {pool.submit(_encode_job, job, ddsdir): job for job in todo}
-            for future in as_completed(futures):
-                future.result()
-                done += 1
-                if progress:
-                    progress(done, len(todo), futures[future]["node"].texture or "")
-    return _texture_rows(jobs, folder), skipped, len(todo)
-
-
-def texture_bundles_of(name: str, info: dict, folder: str) -> list:
-    """Every bundle that holds this texture (from the workspace's index).
-
-    The index is built by the app when the workspace is created; an older
-    workspace (or one whose texture the index has not seen) falls back to the
-    bundle the app recorded, which is what the pre-index builds did.
-    """
-    manifest = _manifest(folder) or {}
-    table = manifest.get("texture_bundles") or {}
-    found = [h for h in (table.get(name) or []) if h]
-    if not found and info.get("bundle"):
-        found = [info["bundle"]]
-    return found
-
-
-def _image_stamp(image, info: dict):
-    """Identity of "this source image, for this target" — None when it has no file.
-
-    A painted/generated datablock has no file to watch (or is dirty in memory), so
-    it is always re-encoded; a loaded PNG/JPG is reused until the file's mtime or
-    size changes, or the datablock gets edited without saving.
-    """
-    path = getattr(image, "filepath", "") or ""
-    if not path or not os.path.isfile(path) or getattr(image, "is_dirty", False):
-        return None
-    try:
-        stat = os.stat(path)
-    except OSError:
-        return None
-    exe = _texconv()
-    return {
-        "source": os.path.normcase(os.path.abspath(path)),
-        "mtime": int(stat.st_mtime),
-        "size": int(stat.st_size),
-        "image": image.name,
-        "format": info.get("format"),
-        "width": info.get("width"),
-        "height": info.get("height"),
-        "mips": info.get("mips"),
-        "texconv": int(os.path.getmtime(exe)) if os.path.isfile(exe) else 0,
-    }
-
-
-def _cache_hit(sidecar: str, stamp: dict) -> bool:
-    try:
-        with open(sidecar, encoding="utf-8") as fh:
-            return json.load(fh) == stamp
-    except Exception:
-        return False
-
-
 def generate_mod(folder: str, label: str = "", context=None, tree=None, progress=None) -> dict:
-    """Synchronous 生成 Mod (headless / scripted use).
-
-    The operator drives `Generation` step by step so Blender keeps redrawing; this
-    wrapper runs the same steps in a loop and returns the packed summary.
-    """
+    """Synchronous 生成 Mod (headless / scripted use)."""
     run = Generation(folder, label, tree=tree, progress=progress).start()
-    try:
-        while not run.step():
-            pass
-    finally:
-        run.close()
     return run.summary
 
 
 class Generation:
-    """One 生成 Mod run, split so the window keeps redrawing while it works.
+    """One 生成 Mod run: export meshes, PNGs and `job.json` — nothing else.
 
-    `start()` does everything that needs `bpy` (graph walk, mesh export, writing
-    the replacement PNGs); `step()` is called from a modal timer and drains the
-    texconv threads, then runs the `modpack` core command in another thread.  The
-    synchronous `generate_mod()` below just loops `step()` — same result, no UI.
+    Unity asset work (opening bundles, encoding textures, writing
+    `<hash>.bundle` + `mod.json`) belongs to the Rust core inside EXMT.  Keeping
+    it there is why this class no longer starts a Python subprocess with
+    `cwd=C:\\Dev\\EXMT\\core` — the directory the app deleted together with its
+    Python core, and the source of `[WinError 267] 目录名称无效`.
     """
 
     def __init__(self, folder: str, label: str = "", tree=None, progress=None,
@@ -1620,16 +1181,9 @@ class Generation:
         #: which rig it bound a foreign mesh to.  Optional for headless runs.
         self.report = report
         self.summary = None
-        self.error = None
         self.generate_nodes = []
-        self._pool = None
-        self._jobs = []
-        self._futures = {}
-        self._todo = 0
-        self._done = 0
-        self._pack_future = None
 
-    # -- phase A: main thread, may touch bpy -------------------------------- #
+    # -- the whole run (main thread; may touch bpy) ------------------------- #
     def start(self) -> "Generation":
         folder, label = self.folder, self.label
         manifest = _manifest(folder)
@@ -1647,7 +1201,6 @@ class Generation:
                     with open(spec_path, encoding="utf-8") as fh:
                         extra = json.load(fh)
                 break
-        self.bundles = manifest.get("bundles") or extra.get("bundles") or {}
         self.mesh_bundles = manifest.get("mesh_bundles") or extra.get("mesh_bundles") or {}
 
         trees = [self.tree] if self.tree is not None else [
@@ -1659,22 +1212,18 @@ class Generation:
         if not trees:
             raise RuntimeError("这个工作空间还没有蓝图：先在 EXMT 面板点「一键导入当前工作空间」")
 
-        by_index = {int(row["index"]): row for row in rows}
-        work = os.path.join(bpy.app.tempdir or tempfile.gettempdir(), "exmt-mod")
-        os.makedirs(work, exist_ok=True)
-        self.work = work
-        self.outdir = os.path.join(folder, "GeneratedMod")
-        self.patchdir = os.path.join(self.outdir, "patches")
-        os.makedirs(self.patchdir, exist_ok=True)
+        outdir = os.path.join(folder, "GeneratedMod")
+        patchdir = os.path.join(outdir, "patches")
+        texturedir = os.path.join(outdir, "textures")
+        os.makedirs(patchdir, exist_ok=True)
+        os.makedirs(texturedir, exist_ok=True)
 
-        # the graph decides what gets packed: walk every generate node (through any
-        # 分组 node) and take each 物体 node's own submesh.  A node that is not
-        # plugged in — an import you only keep for reference — is never packed.
-        meshes = []
+        # the graph decides what gets packed: walk every generate node (through
+        # any 分组 node) and take each 物体 node's own submesh.  A node that is
+        # not plugged in — an import you only keep for reference — is never packed.
+        by_index = {int(row["index"]): row for row in rows}
         filled = {}
-        textures = []
-        texture_skipped = []
-        texture_jobs = []
+        warnings = []
         for group in trees:
             for node in group.nodes:
                 if node.bl_idname != "EXMTNodeGenerate":
@@ -1687,26 +1236,15 @@ class Generation:
                     if row is None or obj is None or obj.type != "MESH":
                         continue
                     filled[int(index)] = (obj, row)      # later blueprints win
-            jobs, skipped_tex = _texture_jobs(group, folder, self.patchdir,
-                                              blueprint.texture_meta(group))
-            merged = {row["name"]: row for row in texture_jobs}
-            merged.update({job["node"].texture: job for job in jobs})
-            texture_jobs = list(merged.values())
-            texture_skipped.extend(skipped_tex)
 
+        meshes = []
         for index, (obj, row) in sorted(filled.items()):
             mesh_name = row["mesh"]
-            path = os.path.join(self.patchdir, mesh_name + ".exmtmesh")
+            path = os.path.join(patchdir, mesh_name + ".exmtmesh")
             # The channel table decides what an object is.  A static prop (the
             # effects plane, `..._Audio_lod0`, Light/Sight/Silencer attachments)
-            # has no skinning and must not borrow a bone table — that borrowed
-            # 168-bone table is what produced the "168 个顶点组全部对不上" error
-            # while exporting a mesh the rig has nothing to do with.
-            #
-            # A skinned object without its own table (MMD/VRM/another game) does
-            # need the target's, or every group name resolves to None and the
-            # packed mesh is not skinned at all (measured 2026-10-19: Sally_outfit
-            # -> all weights 0.0, no bone hashes).
+            # has no skinning and must not borrow a bone table; a foreign skinned
+            # mesh does need the target's, or every group name resolves to None.
             skinned = mesh_io.has_skin(obj)
             target_bones = row.get("bones")
             if (skinned and not obj.get("exmt_bones")
@@ -1724,14 +1262,22 @@ class Generation:
                 self.report({"WARNING"}, "「%s」没有蒙皮，目标网格 %s 却有 %d 根骨骼："
                                          "生成后它不会跟随骨骼（游戏里可能不显示）"
                             % (obj.name, mesh_name, int(target_bones)))
+            # A foreign model needs the target's own bone table; the workspace
+            # export writes it next to the mesh row.  Native meshes carry
+            # `exmt_bones` inside the `.exmtmesh` and need nothing here.
             bone_table = None
             if skinned and not obj.get("exmt_bones"):
-                bone_table = target_bone_table(row.get("bundle", ""), mesh_name)
+                bone_table = row.get("bone_table") or None
+                if not bone_table:
+                    warnings.append("「%s」缺少目标骨骼表：重新导出工作空间后才能正确匹配权重"
+                                    % obj.name)
             # a foreign model usually carries far more material slots than the game
             # mesh: everything past its slot count is a submesh Unity never draws
             slots_limit = 0
             if len(obj.material_slots) > 1:
-                slots_limit = target_material_slots(row.get("bundle", ""), mesh_name)
+                slots_limit = int(row.get("materials") or 0)
+                if not slots_limit:
+                    warnings.append("「%s」有多个材质槽，但工作空间没有记录目标子网格数" % obj.name)
             info = mesh_io.export_mesh(obj, path, {"name": mesh_name},
                                        bone_table=bone_table, material_slots=slots_limit,
                                        skinned=skinned)
@@ -1745,100 +1291,91 @@ class Generation:
                        "?" if target_bones is None else target_bones))
             if skinned and bone_table:
                 mesh_io.reuse_rig(obj, bone_table, self.report)
-            for hash_ in [h for h in (self.mesh_bundles.get(mesh_name) or [row.get("bundle", "")]) if h]:
-                meshes.append({"bundle": hash_, "mesh": mesh_name, "file": path})
+            bundles = [h for h in (self.mesh_bundles.get(mesh_name)
+                                   or [row.get("bundle", "")]) if h]
+            for hash_ in bundles:
+                meshes.append({"bundle": hash_, "mesh": mesh_name,
+                               "file": _relative(path, outdir)})
 
-        textures = _texture_rows(texture_jobs, folder)
-        skipped = [row["alias"] for index, row in sorted(by_index.items()) if index not in filled]
+        # Replacement textures: one PNG per texture node that has an image.  The
+        # target format/size/mips are read from the bundle by EXMT at pack time,
+        # so the add-on no longer needs `texinfo`.
+        textures = {}
+        texture_skipped = []
+        for group in trees:
+            for node in group.nodes:
+                if node.bl_idname != "EXMTNodeTexture":
+                    continue
+                name = node.texture or ""
+                if not name:
+                    continue
+                if node.image is None:
+                    texture_skipped.append(name)
+                    continue
+                if name in textures:
+                    continue
+                bundles = _texture_bundles(manifest, name)
+                if not bundles:
+                    texture_skipped.append("%s（本体里找不到这个贴图包）" % name)
+                    continue
+                png = os.path.join(texturedir, _safe_stem(name) + ".png")
+                try:
+                    _save_png(node.image, png)
+                except Exception as exc:  # noqa: BLE001 - one image must not sink the run
+                    texture_skipped.append("%s（写出失败：%s）" % (name, exc))
+                    continue
+                textures[name] = {"name": name, "file": _relative(png, outdir),
+                                  "bundles": bundles}
+
+        # GeneratedMod mirrors what this run contains: drop patches the blueprint
+        # no longer points at, and the `.bin` files the old Python-core flow left.
+        keep_meshes = {os.path.basename(item["file"]) for item in meshes}
+        for name in os.listdir(patchdir):
+            path = os.path.join(patchdir, name)
+            if name.endswith(".exmtmesh") and name not in keep_meshes:
+                _remove(path)
+            elif name.endswith((".bin", ".bin.json")):
+                _remove(path)
+        keep_textures = {os.path.basename(item["file"]) for item in textures.values()}
+        for name in os.listdir(texturedir):
+            if name.endswith(".png") and name not in keep_textures:
+                _remove(os.path.join(texturedir, name))
+
         if not meshes and not textures:
             raise RuntimeError("蓝图里还没有任何东西连上：把「物体」或「贴图」节点连到「生成 Mod」节点")
 
-        self.textures = textures
-        self.meshes = meshes
-        self.filled = filled
-        self.skipped = skipped
-        self.texture_skipped = texture_skipped
-        self.texture_jobs = texture_jobs
-
-        spec = {
-            "outdir": self.outdir,
+        job = {
+            "format": "exmt-blender-job-1",
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "workspace": folder,
+            "workspace_id": manifest.get("workspace_id", ""),
             "label": label or manifest.get("label", ""),
-            "workspace": manifest.get("workspace_id", "") or folder,
-            "game_bundles": manifest.get("game_bundles", ""),
-            "bundles": self.bundles,
             "meshes": meshes,
-            "textures": textures,
+            "textures": list(textures.values()),
+            "warnings": warnings,
         }
-        self.spec_path = os.path.join(work, "modspec.json")
-        with open(self.spec_path, "w", encoding="utf-8") as fh:
-            json.dump(spec, fh, ensure_ascii=False)
+        job_path = os.path.join(outdir, "job.json")
+        tmp = job_path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(job, fh, ensure_ascii=False, indent=1)
+        os.replace(tmp, job_path)
 
-        # drop patch files nothing points at any more (a slot was unlinked or
-        # swapped), so `GeneratedMod/patches` mirrors what this Mod contains
-        keep = {os.path.basename(item["file"]) for item in meshes + textures}
-        for name in os.listdir(self.patchdir):
-            if name.endswith((".exmtmesh", ".bin")) and name not in keep:
-                try:
-                    os.remove(os.path.join(self.patchdir, name))
-                except OSError:
-                    pass
-            elif name.endswith(".bin.json") and name[:-5] not in keep:
-                try:
-                    os.remove(os.path.join(self.patchdir, name))
-                except OSError:
-                    pass
-
-        todo = [job for job in texture_jobs if not job["cached"]]
-        self._todo = len(todo)
-        self._done = 0
-        if todo:
-            ddsdir = os.path.join(bpy.app.tempdir or tempfile.gettempdir(), "exmt-tex", "dds")
-            os.makedirs(ddsdir, exist_ok=True)
-            self._pool = ThreadPoolExecutor(max_workers=min(len(todo), 6))
-            self._futures = {self._pool.submit(_encode_job, job, ddsdir): job for job in todo}
+        skipped = [row["alias"] for index, row in sorted(by_index.items()) if index not in filled]
+        self.summary = {
+            "dir": outdir,
+            "meshes": len(filled),
+            "rows": len(meshes),
+            "textures": len(textures),
+            "skipped": skipped,
+            "skipped_textures": texture_skipped,
+            "warnings": warnings,
+        }
         return self
 
-    # -- phase B: called from a timer / modal ------------------------------- #
-    def step(self) -> bool:
-        """One UI tick.  Returns True when the whole run is finished."""
-        for future in [f for f in self._futures if f.done()]:
-            job = self._futures.pop(future)
-            try:
-                future.result()
-            except Exception as exc:  # noqa: BLE001 - report, keep the rest going
-                self.texture_skipped.append("%s（编码失败：%s）" % (job["node"].texture, exc))
-            self._done += 1
-            if self.progress:
-                self.progress(self._done, max(1, self._todo), job["node"].texture or "")
-        if self._futures:
-            return False
 
-        if self._pack_future is None:
-            if self.progress:
-                self.progress(self._todo, max(1, self._todo), "打包")
-            self._pool = self._pool or ThreadPoolExecutor(max_workers=1)
-            self._pack_future = self._pool.submit(run_core, ["modpack", self.spec_path], 900)
-            return False
-        if not self._pack_future.done():
-            return False
-
-        res = self._pack_future.result()
-        summary = json.loads(res["stdout"].strip().splitlines()[-1])
-        summary["skipped"] = self.skipped
-        summary["packed"] = len(self.filled)
-        summary["packed_textures"] = len(self.textures)
-        summary["skipped_textures"] = self.texture_skipped
-        summary["encoded_textures"] = self._todo
-        self.summary = summary
-        self.close()
-        return True
-
-    def close(self) -> None:
-        if self._pool is not None:
-            self._pool.shutdown(wait=False)
-            self._pool = None
-
-
+# --------------------------------------------------------------------------- #
+# panel
+# --------------------------------------------------------------------------- #
 class EXMT_PT_panel(Panel):
     bl_label = "EXMT Modbox"
     bl_idname = "EXMT_PT_panel"
@@ -1860,7 +1397,7 @@ class EXMT_PT_panel(Panel):
             box.label(text="未找到 EXMTConfig.json", icon="ERROR")
         box.operator("exmt.import_workspace", icon="IMPORT")
 
-        # 蓝图：选一个、新建、打开节点编辑器、删除；生成按钮在生成节点上也有
+        # 蓝图：选一个、新建、打开节点编辑器、删除；导出按钮在生成节点上也有
         box = layout.box()
         box.label(text="蓝图")
         box.prop(context.scene, "exmt_blueprint", text="")
@@ -1878,6 +1415,7 @@ class EXMT_PT_panel(Panel):
             op = box.operator("exmt.generate_mod", icon="PACKAGE")
             op.workspace = tree.workspace or (info or {}).get("dir", "")
             op.blueprint = tree.name
+            box.label(text="导出后在 EXMT 点「加载到游戏」完成打包", icon="INFO")
         else:
             box.label(text="先点「一键导入当前工作空间」", icon="INFO")
 
@@ -1891,17 +1429,10 @@ class EXMT_PT_panel(Panel):
         box.label(text="外部衣服")
         box.operator("exmt.transfer_weights", icon="MOD_VERTEX_WEIGHT")
 
-        box = layout.box()
-        box.label(text="Bundle 流程")
-        op = box.operator("exmt.extract_bundle", icon="PACKAGE")
-        op = box.operator("exmt.export_and_pack", icon="FILE_TICK")
-
 
 class EXMT_AddonPreferences(AddonPreferences):
     bl_idname = __name__
 
-    core_dir: StringProperty(name="核心目录（exmt_core）", default=DEFAULT_CORE, subtype="DIR_PATH")
-    python_exe: StringProperty(name="Python 解释器", default=DEFAULT_PYTHON, subtype="FILE_PATH")
     config_path: StringProperty(
         name="EXMTConfig.json",
         default=DEFAULT_CONFIG,
@@ -1916,8 +1447,6 @@ class EXMT_AddonPreferences(AddonPreferences):
 
     def draw(self, context):
         layout = self.layout
-        layout.prop(self, "core_dir")
-        layout.prop(self, "python_exe")
         layout.prop(self, "config_path")
         layout.prop(self, "workspace_dir")
 
@@ -1928,9 +1457,6 @@ classes = (
     EXMT_OT_import_mesh,
     EXMT_OT_export_mesh,
     EXMT_OT_transfer_weights,
-    EXMT_OT_extract_bundle,
-    EXMT_OT_pack_bundle,
-    EXMT_OT_export_and_pack,
     EXMT_OT_import_workspace,
     EXMT_OT_generate_mod,
     EXMT_PT_panel,

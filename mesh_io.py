@@ -15,7 +15,7 @@ import bpy
 import numpy as np
 from mathutils import Matrix, Vector
 
-FORMAT = "exmt-mesh-1"
+FORMAT = "exmt-mesh-2"
 
 # Attributes that carry the game's own tangents across an edit session (Blender
 # has no tangent accessor of its own; recomputing them changes normal-mapped

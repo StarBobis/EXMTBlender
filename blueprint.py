@@ -95,6 +95,11 @@ def _manifest_rows(data: dict) -> list:
             # the app records the target's bone-table size here; the packer uses
             # it to tell a static Submesh (0) from a skinned one before exporting
             "bones": item.get("bones", 0),
+            # `materials` = the renderer's submesh count (a foreign model with
+            # more slots has parts Unity never draws) and `bone_table` = the
+            # target's own bones, used when a foreign mesh is exported into it.
+            "materials": item.get("materials", 0),
+            "bone_table": item.get("bone_table") or [],
         })
     return out
 
@@ -308,8 +313,9 @@ def texture_items(tree) -> list:
              "%s  %sx%s" % (row.get("name", "").replace("c_AlvaSSR0102_slg_", ""),
                             row.get("width", "?"), row.get("height", "?")),
              "%s  %s  %dx%d  %d mips" % (texture_kind(row.get("name", "")),
-                                         row.get("format_name") or "?", row.get("width", 0),
-                                         row.get("height", 0), row.get("mips", 1)))
+                                         row.get("format_name") or "?",
+                                         row.get("width") or 0, row.get("height") or 0,
+                                         row.get("mips") or 1))
             for row in rows
         ]
     _CACHE["texture_items"][key] = items
@@ -529,8 +535,8 @@ class EXMTNodeTexture(Node):
             layout.label(text="先选一张贴图", icon="ERROR")
             return
         info = "%s · %dx%d · %s · %d mips" % (
-            texture_kind(row.get("name", "")), row.get("width", 0), row.get("height", 0),
-            row.get("format_name") or "?", row.get("mips", 1))
+            texture_kind(row.get("name", "")), row.get("width") or 0, row.get("height") or 0,
+            row.get("format_name") or "?", row.get("mips") or 1)
         layout.label(text=info, icon="INFO" if row.get("supported", True) else "ERROR")
 
         # The map about to be replaced, so nobody has to recognise the name by
