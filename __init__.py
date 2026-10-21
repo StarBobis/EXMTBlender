@@ -1,7 +1,7 @@
 bl_info = {
     "name": "EXMT Modbox Bridge",
     "author": "EXMT",
-    "version": (0, 7, 1),
+    "version": (0, 7, 2),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > EXMT",
     "description": "Import the workspace selected in EXMT Modbox, edit or replace meshes and textures in a blueprint, then pack them back into bundles",
@@ -204,6 +204,12 @@ class EXMT_OT_transfer_weights(Operator):
         if src is None or src.type != "MESH":
             self.report({"ERROR"}, "找不到权重来源网格：%s" % self.source)
             return {"CANCELLED"}
+        if not mesh_io.has_skin(src):
+            # a static prop has nothing to transfer; the old flow silently created
+            # an Armature modifier with zero groups and called it a success
+            self.report({"ERROR"}, "来源网格 %s 没有蒙皮权重（是静态网格），无法传递权重；"
+                                   "选一个带骨骼的网格（身体/衣服/头发…）作为来源" % src.name)
+            return {"CANCELLED"}
 
         # 1) copy weights by nearest-face interpolation
         #    DataTransfer only writes into *existing* vertex groups, so mirror the
@@ -298,9 +304,14 @@ class EXMT_OT_export_and_pack(Operator):
             return {"CANCELLED"}
         tmp = os.path.join(bpy.app.tempdir, "exmt_pack.exmtmesh")
         # a foreign mesh has no bone table of its own: weights are matched by bone
-        # name against the game mesh it replaces
-        table = None if obj.get("exmt_bones") else target_bone_table(self.bundle, self.mesh_name)
-        info = mesh_io.export_mesh(obj, tmp, {"name": self.mesh_name}, bone_table=table)
+        # name against the game mesh it replaces.  A mesh with no skinning at all
+        # (a static prop / weapon attachment) must not borrow that table.
+        skinned = mesh_io.has_skin(obj)
+        table = None
+        if skinned and not obj.get("exmt_bones"):
+            table = target_bone_table(self.bundle, self.mesh_name)
+        info = mesh_io.export_mesh(obj, tmp, {"name": self.mesh_name},
+                                   bone_table=table, skinned=skinned)
         run_core(["pack", self.bundle, self.mesh_name, tmp, self.output])
         msg = "已打包 %s（%d 顶点）" % (os.path.basename(self.output), info["verts"])
         dropped = int(info.get("dropped_influences") or 0)
@@ -863,6 +874,10 @@ class EXMT_OT_import_workspace(Operator):
         if armature is not None and manifest.get("animations"):
             anims, anim_names, anim_notes = _animation_actions(folder, armature, bones, label)
 
+        # 有多少网格真的蒙皮：静态网格（特效面片、Audio、枪械配件）不挂骨架
+        skinned = sum(1 for obj in imported.values() if obj.get("exmt_skinned"))
+        static = [obj.name for obj in imported.values() if not obj.get("exmt_skinned")]
+
         # one blueprint per import; its object nodes are pre-wired to the imported
         # meshes, so 「生成 Mod」 works immediately and you only re-wire what you swap
         tree = blueprint.new_blueprint(folder, label)
@@ -879,12 +894,17 @@ class EXMT_OT_import_workspace(Operator):
                                      "回 App 重新点一次「开始制作」即可拿到完整骨架"
                         % (len(imported), len(tex_paths), label))
             return {"FINISHED"}
-        self.report({"INFO"}, "导入 %d 个网格 · %d 张贴图 · %d 根骨骼 · %d 个动作 · %s · 集合「%s」 · 蓝图「%s」%s"
+        self.report({"INFO"}, "导入 %d 个网格（%d 蒙皮 · %d 静态） · %d 张贴图 · %d 根骨骼 · %d 个动作 · %s · "
+                              "集合「%s」 · 蓝图「%s」%s"
                               "（%d 个物体 + %d 个贴图节点，Frame「%s」%s）"
-                    % (len(imported), len(tex_paths), len(bones), anims, label,
+                    % (len(imported), skinned, len(imported) - skinned, len(tex_paths),
+                       len(bones), anims, label,
                        collection.name, tree.name, reused, wired["wired"], wired["textures"],
                        wired["frame"],
                        ("，清掉 %d 个被替换的旧网格" % dropped) if dropped else ""))
+        if static:
+            self.report({"INFO"}, "%d 个静态网格没有蒙皮数据，不挂到骨架上：%s"
+                        % (len(static), "、".join(static[:5]) + ("…" if len(static) > 5 else "")))
         if anims:
             self.report({"INFO"}, "动作已挂在这副骨架上：%s" % "、".join(anim_names[:4]))
         # 动作和骨架的匹配度必须说出来：动作是按角色做的，骨架是"你勾了哪些网格"的并集
@@ -1195,7 +1215,8 @@ class EXMT_OT_generate_mod(Operator):
         self._pushed = False
         self._timer = None
         try:
-            self._run = Generation(folder, self.label, tree=tree, progress=self._progress).start()
+            self._run = Generation(folder, self.label, tree=tree, progress=self._progress,
+                                   report=self.report).start()
         except Exception as exc:  # noqa: BLE001 - surface the core's message
             self._run = None
             return str(exc)[:300]
@@ -1589,11 +1610,15 @@ class Generation:
     synchronous `generate_mod()` below just loops `step()` — same result, no UI.
     """
 
-    def __init__(self, folder: str, label: str = "", tree=None, progress=None):
+    def __init__(self, folder: str, label: str = "", tree=None, progress=None,
+                 report=None):
         self.folder = folder
         self.label = label
         self.tree = tree
         self.progress = progress
+        #: `operator.report` when driven from the UI: `reuse_rig` wants to say
+        #: which rig it bound a foreign mesh to.  Optional for headless runs.
+        self.report = report
         self.summary = None
         self.error = None
         self.generate_nodes = []
@@ -1672,14 +1697,35 @@ class Generation:
         for index, (obj, row) in sorted(filled.items()):
             mesh_name = row["mesh"]
             path = os.path.join(self.patchdir, mesh_name + ".exmtmesh")
-            # An imported workspace mesh carries its own bone table; a foreign one
-            # (MMD/VRM/another game) does not, and it must borrow the table of the
-            # slot it fills.  Without `bone_table` the exporter resolved every
-            # group name to None and dropped every influence, writing a mesh with
-            # no skinning at all — the game then shows nothing (measured
-            # 2026-10-19: Sally_outfit -> all weights 0.0, no bone hashes).
+            # The channel table decides what an object is.  A static prop (the
+            # effects plane, `..._Audio_lod0`, Light/Sight/Silencer attachments)
+            # has no skinning and must not borrow a bone table — that borrowed
+            # 168-bone table is what produced the "168 个顶点组全部对不上" error
+            # while exporting a mesh the rig has nothing to do with.
+            #
+            # A skinned object without its own table (MMD/VRM/another game) does
+            # need the target's, or every group name resolves to None and the
+            # packed mesh is not skinned at all (measured 2026-10-19: Sally_outfit
+            # -> all weights 0.0, no bone hashes).
+            skinned = mesh_io.has_skin(obj)
+            target_bones = row.get("bones")
+            if (skinned and not obj.get("exmt_bones")
+                    and target_bones is not None and int(target_bones) == 0):
+                # e.g. a rigged PMX wired to a weapon sight: the game mesh has no
+                # skeleton, so there is nothing to transfer weights *to*
+                raise RuntimeError(
+                    "「%s」带蒙皮，但目标 Submesh「%s」的网格 %s 是静态网格（0 根骨骼，"
+                    "游戏里不按骨骼驱动）：换一个带骨骼的 Submesh；或者先清掉这个物体的"
+                    "顶点组和 Armature 修改器，把它当静态模型生成。"
+                    % (obj.name, row.get("alias", index), mesh_name))
+            if not skinned and target_bones and int(target_bones) > 0 and callable(self.report):
+                # the reverse mismatch: a static prop can be packed into a skinned
+                # slot, but the game will have no weights for it
+                self.report({"WARNING"}, "「%s」没有蒙皮，目标网格 %s 却有 %d 根骨骼："
+                                         "生成后它不会跟随骨骼（游戏里可能不显示）"
+                            % (obj.name, mesh_name, int(target_bones)))
             bone_table = None
-            if not obj.get("exmt_bones"):
+            if skinned and not obj.get("exmt_bones"):
                 bone_table = target_bone_table(row.get("bundle", ""), mesh_name)
             # a foreign model usually carries far more material slots than the game
             # mesh: everything past its slot count is a submesh Unity never draws
@@ -1687,13 +1733,17 @@ class Generation:
             if len(obj.material_slots) > 1:
                 slots_limit = target_material_slots(row.get("bundle", ""), mesh_name)
             info = mesh_io.export_mesh(obj, path, {"name": mesh_name},
-                                       bone_table=bone_table, material_slots=slots_limit)
-            if info.get("groups") and not info.get("influenced"):
+                                       bone_table=bone_table, material_slots=slots_limit,
+                                       skinned=skinned)
+            # Only complain when there *were* weights to lose; a static mesh has
+            # none, and a zero-weight group list is not a binding failure.
+            if skinned and info.get("weighted") and not info.get("influenced"):
                 raise RuntimeError(
-                    "「%s」的权重一根骨骼都没匹配上（%d 个顶点组全部对不上目标网格 %s 的骨骼）："
+                    "「%s」的权重一根骨骼都没匹配上（%d 个顶点组全部对不上目标网格 %s 的 %s 根骨骼）："
                     "先在面板里用「传递权重并绑定骨架」把这个物体的权重刷到目标骨架上，再生成 Mod。"
-                    % (obj.name, info.get("groups"), mesh_name))
-            if bone_table:
+                    % (obj.name, info.get("groups"), mesh_name,
+                       "?" if target_bones is None else target_bones))
+            if skinned and bone_table:
                 mesh_io.reuse_rig(obj, bone_table, self.report)
             for hash_ in [h for h in (self.mesh_bundles.get(mesh_name) or [row.get("bundle", "")]) if h]:
                 meshes.append({"bundle": hash_, "mesh": mesh_name, "file": path})

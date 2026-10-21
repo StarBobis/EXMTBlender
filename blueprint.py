@@ -30,32 +30,59 @@ from bpy.utils import register_class, unregister_class
 
 
 # --------------------------------------------------------------------------- #
-# the workspace's submesh list (written by the app when it exports)
+# the workspace manifest, parsed once per file change
 # --------------------------------------------------------------------------- #
-def manifest(folder: str) -> dict:
-    path = os.path.join(folder or "", "workspace.json")
-    if not folder or not os.path.isfile(path):
-        return {}
+# The node editor redraws *every* node on every mouse move, and a node's label,
+# its enum items and its info line all used to call `manifest()` directly: that
+# is one open + `json.loads` of workspace.json per node per frame (measured: 34
+# nodes, i.e. 34 file reads for a single redraw).  Dragging felt like a slideshow
+# and the graph was blamed for it.  The file only changes when the app exports a
+# workspace, so parse it once and key the cache on (mtime, size) — a re-export
+# invalidates itself, no hooks needed.
+_CACHE = {
+    "workspace": {},   # path -> (stamp, data, rows)
+    "items": {},       # path -> (stamp, enum items)
+    "texture_rows": {},
+    "texture_items": {},
+    "texture_meta": {},
+    "images": {},
+}
+_CACHE_LIMIT = 16
+
+
+def _stamp(path: str):
+    """Identity of a file's contents, or None when it cannot be read."""
     try:
-        with open(path, encoding="utf-8") as fh:
-            return json.load(fh)
-    except Exception:
-        return {}
+        stat = os.stat(path)
+    except OSError:
+        return None
+    return (stat.st_mtime_ns, stat.st_size)
 
 
-def submeshes(folder: str) -> list:
-    """`[{index, alias, mesh, bundle, file, verts}]` in the app's order.
+def _pathkey(folder: str) -> str:
+    """Normalised workspace.json path; '' for 'no workspace'."""
+    if not folder:
+        return ""
+    return os.path.normcase(os.path.abspath(os.path.join(folder, "workspace.json")))
 
-    The app writes `index`/`alias` on every entry of `meshes` when it exports, so
-    the index a slot refers to is decided **there**, once. Workspaces exported
-    before that fall back to the mesh order (which is the same thing).
-    """
-    data = manifest(folder)
+
+def _trim(cache: dict) -> None:
+    while len(cache) > _CACHE_LIMIT:
+        cache.pop(next(iter(cache)))
+
+
+def _manifest_rows(data: dict) -> list:
+    """`[{index, alias, mesh, bundle, file, verts, bones}]` from a parsed workspace."""
     rows = data.get("submeshes")
-    if rows:
+    if isinstance(rows, list) and rows:
         return rows
+    meshes = data.get("meshes")
+    if not isinstance(meshes, list):
+        meshes = []
     out = []
-    for position, item in enumerate(data.get("meshes", [])):
+    for position, item in enumerate(meshes):
+        if not isinstance(item, dict):
+            continue
         mesh_name = item.get("mesh", "")
         short = re.sub(r"^c_[A-Za-z0-9]+_(?:slg_)?", "", mesh_name) or mesh_name
         out.append({
@@ -65,20 +92,72 @@ def submeshes(folder: str) -> list:
             "mesh": mesh_name,
             "bundle": item.get("bundle", ""),
             "verts": item.get("verts", 0),
+            # the app records the target's bone-table size here; the packer uses
+            # it to tell a static Submesh (0) from a skinned one before exporting
+            "bones": item.get("bones", 0),
         })
     return out
 
 
+def _workspace(folder: str) -> tuple:
+    """(stamp, manifest dict, submesh rows) — one `stat` per call when cached."""
+    key = _pathkey(folder)
+    path = os.path.join(folder, "workspace.json") if folder else ""
+    stamp = _stamp(path) if path else None
+    hit = _CACHE["workspace"].get(key)
+    if hit is not None and hit[0] == stamp:
+        return hit
+    data = {}
+    if path and stamp is not None:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except Exception:
+            data = {}
+    if not isinstance(data, dict):
+        data = {}
+    rows = _manifest_rows(data) if data else []
+    hit = (stamp, data, rows)
+    _CACHE["workspace"][key] = hit
+    _trim(_CACHE["workspace"])
+    _CACHE["items"].pop(key, None)
+    # texture rows/items also depend on the tree's cached format table, so they
+    # are keyed by (workspace, that string) and skipped here when the file moves
+    return hit
+
+
+def manifest(folder: str) -> dict:
+    return _workspace(folder)[1]
+
+
+def submeshes(folder: str) -> list:
+    """`[{index, alias, mesh, bundle, file, verts, bones}]` in the app's order.
+
+    The app writes `index`/`alias` on every entry of `meshes` when it exports, so
+    the index a slot refers to is decided **there**, once. Workspaces exported
+    before that fall back to the mesh order (which is the same thing).
+    """
+    return _workspace(folder)[2]
+
+
 def submesh_items(folder: str) -> list:
     """EnumProperty items: identifier = index as a string, label = `0. body_lod0`."""
-    rows = submeshes(folder)
+    key = _pathkey(folder)
+    stamp, _data, rows = _workspace(folder)
+    hit = _CACHE["items"].get(key)
+    if hit is not None and hit[0] == stamp:
+        return hit[1]
     if not rows:
-        return [("-1", "（没有工作空间）", "")]
-    return [
-        (str(row["index"]), "%d. %s" % (row["index"], row["alias"]),
-         "%s · %s 顶点" % (row["mesh"], row.get("verts", 0)))
-        for row in rows
-    ]
+        items = [("-1", "（没有工作空间）", "")]
+    else:
+        items = [
+            (str(row["index"]), "%d. %s" % (row["index"], row["alias"]),
+             "%s · %s 顶点" % (row["mesh"], row.get("verts", 0)))
+            for row in rows
+        ]
+    _CACHE["items"][key] = (stamp, items)
+    _trim(_CACHE["items"])
+    return items
 
 
 def _rows(tree) -> list:
@@ -99,24 +178,52 @@ def textures(folder: str) -> list:
     bundle itself; the add-on caches the answer on the tree (`texture_meta`) when
     it imports, which keeps the node drawing instant.
     """
-    return manifest(folder).get("textures") or []
+    rows = manifest(folder).get("textures")
+    return rows if isinstance(rows, list) else []
 
 
 def texture_meta(tree) -> dict:
-    try:
-        return json.loads(getattr(tree, "texture_meta", "") or "{}")
-    except Exception:
+    raw = getattr(tree, "texture_meta", "") or ""
+    if not raw:
         return {}
+    hit = _CACHE["texture_meta"].get(raw)
+    if hit is not None:
+        return hit
+    try:
+        data = json.loads(raw)
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    _CACHE["texture_meta"][raw] = data
+    _trim(_CACHE["texture_meta"])
+    return data
 
 
-def texture_rows(tree) -> list:
+def texture_rows(tree) -> tuple:
     """Textures of the tree's workspace merged with the cached format info."""
+    folder = getattr(tree, "workspace", "") or ""
+    stamp, data, _rows = _workspace(folder)
+    key = (_pathkey(folder), stamp, getattr(tree, "texture_meta", "") or "")
+    hit = _CACHE["texture_rows"].get(key)
+    if hit is not None:
+        return hit
     meta = texture_meta(tree)
+    source = data.get("textures")
+    if not isinstance(source, list):
+        source = []
     rows = []
-    for row in textures(getattr(tree, "workspace", "") or ""):
+    for row in source:
+        if not isinstance(row, dict):
+            continue
         merged = dict(row)
-        merged.update(meta.get(row.get("name", ""), {}))
+        info = meta.get(row.get("name", ""))
+        if isinstance(info, dict):
+            merged.update(info)
         rows.append(merged)
+    rows = tuple(rows)
+    _CACHE["texture_rows"][key] = rows
+    _trim(_CACHE["texture_rows"])
     return rows
 
 
@@ -145,47 +252,72 @@ def texture_kind(name: str) -> str:
 def texture_preview(tree, name: str):
     """The extracted PNG of a game texture, as an Image datablock (or None).
 
-    `workspace.json` already records `textures[].file`, so a node can show the map
-    it is about to replace instead of asking the user to recognise
-    `c_VepleySSR01_slg_cloth01_d` by heart.
+    Only drawn for the selected node (see `EXMTNodeTexture.draw_buttons`): loading
+    a 2048² PNG and building its preview for all twenty texture nodes on every
+    redraw was a large part of why the graph felt stuck, so the cache here mainly
+    guarantees the image is loaded once and then reused.
     """
-    for row in textures(getattr(tree, "workspace", "") or ""):
+    folder = getattr(tree, "workspace", "") or ""
+    for row in textures(folder):
         if row.get("name") != name:
             continue
         rel = row.get("file") or ""
         if not rel:
             return None
-        path = os.path.join(getattr(tree, "workspace", "") or "", rel.replace("/", os.sep))
+        path = os.path.join(folder, rel.replace("/", os.sep))
         if not os.path.isfile(path):
             return None
+        cached = _CACHE["images"].get(path)
+        if cached is not None:
+            try:
+                # RNA returns a fresh wrapper on every lookup, so compare the
+                # underlying datablock pointer, not the Python object
+                live = bpy.data.images.get(cached.name)
+                if live is not None and live.as_pointer() == cached.as_pointer():
+                    return live
+            except Exception:
+                pass
         try:
-            return bpy.data.images.load(path, check_existing=True)
+            image = bpy.data.images.load(path, check_existing=True)
         except Exception:
             return None
+        _CACHE["images"][path] = image
+        _trim(_CACHE["images"])
+        return image
     return None
 
 
 def texture_items(tree) -> list:
+    folder = getattr(tree, "workspace", "") or ""
+    stamp = _workspace(folder)[0]
+    key = (_pathkey(folder), stamp, getattr(tree, "texture_meta", "") or "")
+    hit = _CACHE["texture_items"].get(key)
+    if hit is not None:
+        return hit
     rows = texture_rows(tree)
     if not rows:
-        return [("", "(no textures)", "")]
-    # NB: keep enum labels ASCII.  A non-ASCII character (we used "·") makes Blender
-    # 5.2 draw the enum field with a shifted glyph offset, so the field shows garbage
-    # while the same text in a `label` renders fine — measured with a screen capture.
-    # The Chinese kind goes in the *description* (same reason): the label stays ASCII
-    # while the dropdown still says what the map is for.
-    return [
-        (row.get("name", ""),
-         "%s  %sx%s" % (row.get("name", "").replace("c_AlvaSSR0102_slg_", ""),
-                        row.get("width", "?"), row.get("height", "?")),
-         "%s  %s  %dx%d  %d mips" % (texture_kind(row.get("name", "")),
-                                     row.get("format_name") or "?", row.get("width", 0),
-                                     row.get("height", 0), row.get("mips", 1)))
-        for row in rows
-    ]
+        items = [("", "(no textures)", "")]
+    else:
+        # NB: keep enum labels ASCII.  A non-ASCII character (we used "·") makes Blender
+        # 5.2 draw the enum field with a shifted glyph offset, so the field shows garbage
+        # while the same text in a `label` renders fine — measured with a screen capture.
+        # The Chinese kind goes in the *description* (same reason): the label stays ASCII
+        # while the dropdown still says what the map is for.
+        items = [
+            (row.get("name", ""),
+             "%s  %sx%s" % (row.get("name", "").replace("c_AlvaSSR0102_slg_", ""),
+                            row.get("width", "?"), row.get("height", "?")),
+             "%s  %s  %dx%d  %d mips" % (texture_kind(row.get("name", "")),
+                                         row.get("format_name") or "?", row.get("width", 0),
+                                         row.get("height", 0), row.get("mips", 1)))
+            for row in rows
+        ]
+    _CACHE["texture_items"][key] = items
+    _trim(_CACHE["texture_items"])
+    return items
 
 
-def _textures(tree) -> list:
+def _textures(tree) -> tuple:
     return texture_rows(tree)
 
 
@@ -260,20 +392,25 @@ class EXMTNodeObject(Node):
         return "%d. %s" % (row["index"], row["alias"])
 
     def _row(self):
+        # Read the enum *once*: a dynamic EnumProperty re-evaluates its items
+        # callback on every read (measured ~0.017 ms), so reading it inside this
+        # loop made a label cost 20× more than the loop itself.
+        wanted = str(self.submesh)
         for row in _rows(self.id_data):
-            if str(row["index"]) == str(self.submesh):
+            if str(row["index"]) == wanted:
                 return row
         return None
 
     def draw_buttons(self, context, layout):
         layout.prop(self, "object", text="")
         layout.prop(self, "submesh", text="")
-        row = self._row()
-        if row is None:
+        # No mesh name / vertex count / link counters here: the node editor draws
+        # every node on every mouse move, and the graph is only *parsed* when
+        # 「生成 Mod」 runs.  A label that repeats what the header already says is
+        # pure redraw cost.
+        if self.object is not None and str(self.submesh) in ("", "-1"):
             layout.label(text="先选一个 Submesh", icon="ERROR")
-        else:
-            layout.label(text="%s · %s 顶点" % (row["mesh"], row.get("verts", 0)), icon="INFO")
-        if self.object is not None and row is not None and self.object.type != "MESH":
+        if self.object is not None and self.object.type != "MESH":
             layout.label(text="不是网格物体", icon="ERROR")
 
 
@@ -301,7 +438,9 @@ class EXMTNodeGenerate(Node):
     def draw_label(self):
         if self.progress_text:
             return "生成 Mod · %s" % self.progress_text
-        return "生成 Mod（%d 条连线）" % linked_count(self)
+        # Deliberately static: counting sockets here walked the graph on every
+        # redraw.  The run reports what it actually packed.
+        return "生成 Mod"
 
     def ensure_slots(self, spare: int = 1, count: int = 1):
         """Keep `count` free inputs available.
@@ -318,20 +457,11 @@ class EXMTNodeGenerate(Node):
             self.inputs.new("EXMT_NodeSubmeshSocket", "网格 %d" % (len(self.inputs) + 1))
 
     def draw_buttons(self, context, layout):
-        rows = _rows(self.id_data)
-        if not rows:
-            layout.label(text="蓝图没有工作空间", icon="ERROR")
-            return
-        objects = wired_objects(self)
-        lines = len([s for s in self.inputs if s.is_linked])
-        layout.label(text="%d 条连线 · %d 个物体 → %d 个 Submesh" % (lines, len(objects), len(rows)),
-                     icon="LINKED")
-        missing = [s for s in self.inputs if s.is_linked and not socket_ok(s)]
-        if missing:
-            layout.label(text="%d 条连线没指定 Submesh" % len(missing), icon="ERROR")
         row = layout.row(align=True)
         row.operator("exmt.generate_mod", text="生成 Mod", icon="PLAY").blueprint = self.id_data.name
         row.operator("exmt.blueprint_sync", text="＋ 输入口", icon="ADD")
+        if not (getattr(self.id_data, "workspace", "") or ""):
+            layout.label(text="蓝图没有工作空间", icon="ERROR")
 
 
 class EXMTNodeGroup(Node):
@@ -348,7 +478,7 @@ class EXMTNodeGroup(Node):
         self.outputs.new("EXMT_NodeSubmeshSocket", "网格")
 
     def draw_label(self):
-        return "分组（%d 条连线）" % linked_count(self)
+        return "分组"
 
     def ensure_slots(self, spare: int = 1, count: int = 1):
         """Keep `count` free inputs available (see `EXMTNodeGenerate.ensure_slots`)."""
@@ -361,8 +491,6 @@ class EXMTNodeGroup(Node):
         row = layout.row(align=True)
         row.operator("exmt.generate_mod", text="生成 Mod", icon="PLAY").blueprint = self.id_data.name
         row.operator("exmt.blueprint_sync", text="＋ 输入口", icon="ADD")
-        if not self.outputs[0].links:
-            layout.label(text="还没连到「生成 Mod」", icon="INFO")
 
 
 class EXMTNodeTexture(Node):
@@ -387,8 +515,10 @@ class EXMTNodeTexture(Node):
         return (row or {}).get("name", "贴图").replace("c_AlvaSSR0102_slg_", "")
 
     def _row(self):
+        # See `EXMTNodeObject._row`: one enum read, not one per texture row.
+        wanted = self.texture
         for row in _textures(self.id_data):
-            if row.get("name") == self.texture:
+            if row.get("name") == wanted:
                 return row
         return None
 
@@ -403,14 +533,20 @@ class EXMTNodeTexture(Node):
             row.get("format_name") or "?", row.get("mips", 1))
         layout.label(text=info, icon="INFO" if row.get("supported", True) else "ERROR")
 
-        # the map about to be replaced, so nobody has to recognise the name
-        preview = texture_preview(self.id_data, self.texture)
-        if preview is not None:
-            try:
-                layout.template_preview(preview)
-            except Exception:
-                # a preview that cannot draw must never take the node down with it
-                layout.label(text="（这张贴图没有预览）", icon="IMAGE_DATA")
+        # The map about to be replaced, so nobody has to recognise the name by
+        # heart.  Only for the *active* node: a preview decodes a full-resolution
+        # PNG, and drawing one for all twenty texture nodes on every redraw was a
+        # large slice of the node editor's lag.  `self.select` is not enough —
+        # box-selecting the whole texture frame would bring them all back.
+        active = getattr(self.id_data.nodes, "active", None)
+        if active is not None and active.as_pointer() == self.as_pointer():
+            preview = texture_preview(self.id_data, self.texture)
+            if preview is not None:
+                try:
+                    layout.template_preview(preview)
+                except Exception:
+                    # a preview that cannot draw must never take the node down with it
+                    layout.label(text="（这张贴图没有预览）", icon="IMAGE_DATA")
 
         # `template_ID` gives the image field a browse button (opens the file
         # selector) instead of only the datablock dropdown
@@ -419,53 +555,6 @@ class EXMTNodeTexture(Node):
             layout.label(text="未选择替换图（不替换）", icon="INFO")
         elif row.get("supported", True):
             layout.label(text="生成时自动转成 %s" % row.get("format_name"), icon="FILE_REFRESH")
-
-
-def linked_count(node) -> int:
-    return len([s for s in node.inputs if s.is_linked])
-
-
-def _source_submesh(socket):
-    """The object node behind a link, if it has a usable submesh."""
-    if not socket.is_linked:
-        return None
-    node = socket.links[0].from_node
-    if node.bl_idname != "EXMTNodeObject":
-        return None
-    index = str(getattr(node, "submesh", "-1"))
-    if index == "-1" or getattr(node, "object", None) is None:
-        return None
-    return node
-
-
-def socket_objects(socket) -> list:
-    """Object nodes behind one input, looking through `分组` nodes.
-
-    `_source_submesh` only sees a *direct* object node, so a link that arrives via
-    a 分组 used to be reported as "没指定 Submesh" even though packing resolved it
-    fine — the warning must walk the group or it cries wolf on the normal layout.
-    """
-    if not socket.is_linked:
-        return []
-    source = socket.links[0].from_node
-    if source.bl_idname == "EXMTNodeObject":
-        return [source]
-    if source.bl_idname == "EXMTNodeGroup":
-        return walk_objects(source)
-    return []
-
-
-def socket_ok(socket) -> bool:
-    """True when everything behind this input has an object and a submesh."""
-    objects = socket_objects(socket)
-    if not objects:
-        return False
-    for node in objects:
-        if getattr(node, "object", None) is None:
-            return False
-        if str(getattr(node, "submesh", "-1")) == "-1":
-            return False
-    return True
 
 
 def walk_objects(node, seen=None) -> list:
@@ -496,9 +585,25 @@ def wired_objects(generate_node) -> list:
 # --------------------------------------------------------------------------- #
 # operators (creation / editing / slot sync)
 # --------------------------------------------------------------------------- #
+def _edited_tree(context):
+    """The EXMT tree this node editor is showing, if any.
+
+    4.x exposes `edit_tree`; 5.2 made it read-only and added `node_tree`.  Reading
+    either is fine, so try both instead of guessing the Blender version.
+    """
+    space = getattr(context, "space_data", None)
+    if space is None:
+        return None
+    for attr in ("edit_tree", "node_tree"):
+        tree = getattr(space, attr, None)
+        if isinstance(tree, EXMTBlueprintTree):
+            return tree
+    return None
+
+
 def active_blueprint(context):
-    tree = getattr(context.space_data, "edit_tree", None) if context.space_data else None
-    if isinstance(tree, EXMTBlueprintTree):
+    tree = _edited_tree(context)
+    if tree is not None:
         return tree
     scene = getattr(context, "scene", None)
     tree = getattr(scene, "exmt_blueprint", None) if scene else None
@@ -633,8 +738,8 @@ class EXMT_OT_blueprint_sync(Operator):
     count: IntProperty(name="补几个", default=4, min=1, max=32)
 
     def execute(self, context):
-        tree = context.space_data.edit_tree if context.space_data else None
-        if not isinstance(tree, EXMTBlueprintTree):
+        tree = _edited_tree(context)
+        if tree is None:
             tree = getattr(context.scene, "exmt_blueprint", None)
         if tree is None:
             self.report({"ERROR"}, "没有选中蓝图")
@@ -663,8 +768,9 @@ class EXMT_OT_node_add(Operator):
     kind: StringProperty(default="object")
 
     def execute(self, context):
-        tree = context.space_data.edit_tree if context.space_data else None
-        if not isinstance(tree, EXMTBlueprintTree):
+        space = getattr(context, "space_data", None)
+        tree = _edited_tree(context)
+        if tree is None:
             tree = getattr(context.scene, "exmt_blueprint", None)
         if tree is None:
             self.report({"ERROR"}, "没有选中蓝图")
@@ -675,10 +781,34 @@ class EXMT_OT_node_add(Operator):
             "texture": "EXMTNodeTexture",
             "generate": "EXMTNodeGenerate",
         }.get(self.kind, "EXMTNodeObject")
+
+        # Drop it under the mouse (the node editor keeps `cursor_location` current
+        # in tree space).  The old code stacked new nodes below the lowest one in
+        # the graph, which put them metres away from the cursor — the right-click
+        # menu is a pointer verb, so the node has to appear where you clicked.
+        where = None
+        if space is not None and getattr(space, "type", "") == "NODE_EDITOR":
+            try:
+                where = tuple(space.cursor_location)
+            except Exception:
+                where = None
+
         node = tree.nodes.new(idname)
-        # place it below the last node so repeated calls do not stack
-        lowest = min((n.location.y for n in tree.nodes if n is not node), default=0.0)
-        node.location = (0.0, lowest - 240.0)
+        if where is None:
+            # no node-editor context (search menu / script): park it left of the
+            # generate node instead of at the bottom of a possibly huge graph
+            generate = next((n for n in tree.nodes if n.bl_idname == "EXMTNodeGenerate"), None)
+            where = ((generate.location.x - 420.0, generate.location.y)
+                     if generate is not None else (0.0, 0.0))
+        node.location = where
+        # RNA wrappers are recreated per access, so compare pointers — `other is
+        # not node` is always true and would deselect the node we just made.
+        pointer = node.as_pointer()
+        for other in tree.nodes:
+            if other.as_pointer() != pointer:
+                other.select = False
+        node.select = True
+        tree.nodes.active = node
         if node.bl_idname in {"EXMTNodeGenerate", "EXMTNodeGroup"}:
             node.ensure_slots(count=4)
         return {"FINISHED"}

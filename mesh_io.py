@@ -61,12 +61,20 @@ def _bone_view(data, meta) -> tuple:
     Every `.exmtmesh` the app exports carries the skin skeleton; one written by
     this add-on carries its own table in `bone_hashes`/`bindpose` instead.  Both
     end up naming bones identically, which is what makes the groups bind.
+
+    `local` maps a mesh-local bone index to a bone of the merged skeleton.  It is
+    **empty** for a mesh that has no bone table of its own (a static prop): the
+    skeleton view is still the union of the whole character, so treating an
+    absent/empty `local` as "every bone" created one vertex group per skeleton
+    bone for props that have nothing to do with the rig.
     """
     skel = meta.get("skeleton") or {}
     bones = skel.get("bones") or []
     if bones:
-        local = list(skel.get("local") or range(len(bones)))
-        return bones, local
+        local = skel.get("local")
+        if local is None:                  # older file: no frame of reference
+            local = list(range(len(bones)))
+        return bones, list(local)
 
     hashes = None
     bind = None
@@ -90,6 +98,51 @@ def _bone_view(data, meta) -> tuple:
         out.append({"hash": int(h), "name": hash_bone_name(h), "parent": -1,
                     "rest": [float(v) for v in np.asarray(rest).reshape(-1)]})
     return out, list(range(len(out)))
+
+
+def skin_mode(data, meta) -> str:
+    """What the mesh's vertex channels say: `smooth`, `rigid` or `none`.
+
+    The NPZ always carries `weights`/`bones` arrays — zero-filled when the game
+    mesh has no such channel — so their mere presence proves nothing.  The
+    channel table is the authority:
+
+    * weights channel used → normal multi-bone skinning;
+    * weights absent, bone indices present → rigid single-bone skinning.  GF2's
+      face and weapon meshes store one index per vertex and no weights at all
+      (the shader implies weight 1), which the old importer read as "skinned
+      with zero weights": empty groups, no deformation, and an export error;
+    * neither channel → a static prop (`..._1`, `..._Audio_lod0`, the weapon
+      attachments).  Those are not related to the skeleton and must not be
+      parented to it.
+    """
+    channels = meta.get("channels") or []
+
+    def dim(index: int) -> int:
+        try:
+            return int(channels[index].get("dimension") or 0)
+        except Exception:
+            return 0
+
+    def positive(key: str) -> bool:
+        values = data[key] if key in data else None
+        if values is None:
+            return False
+        values = np.asarray(values)
+        return bool(values.size) and float(values.max()) > 0.0
+
+    if channels:
+        if dim(12) > 0:
+            return "smooth" if positive("weights") else "none"
+        if dim(13) > 0:
+            return "rigid"
+        return "none"
+    # files without a channel table (written by old builds): infer from arrays
+    if positive("weights"):
+        return "smooth"
+    if positive("bones"):
+        return "rigid"
+    return "none"
 
 
 def build_armature(name: str, bones: list, scale: float = 1.0):
@@ -163,7 +216,7 @@ def _apply_weights(obj, local, used_bones, bones, weights, bone_count):
     groups = {}
     for idx in range(bone_count):
         gi = local[idx] if idx < len(local) else idx
-        name = bones[gi]["name"] if gi < len(bones) else hash_bone_name(idx)
+        name = bones[gi]["name"] if 0 <= gi < len(bones) else hash_bone_name(idx)
         groups[idx] = obj.vertex_groups.new(name=name)
     for vi in range(used_bones.shape[0]):
         for k in range(used_bones.shape[1]):
@@ -173,6 +226,29 @@ def _apply_weights(obj, local, used_bones, bones, weights, bone_count):
             group = groups.get(int(used_bones[vi, k]))
             if group is not None:
                 group.add([vi], w, "REPLACE")
+
+
+def _apply_rigid_weights(obj, local, used_bones, bones):
+    """Rigid bind: one bone index per vertex, weight 1 — no weights channel.
+
+    `used_bones` is the `m_BoneIndices` column (shape N×1 for GF2's face and
+    weapon meshes).  Assigning a whole bone's vertices in one `group.add` keeps
+    it fast, and — unlike the old path — actually moves the mesh with the pose.
+    """
+    groups = {}
+    for idx in range(len(local)):
+        gi = local[idx] if idx < len(local) else idx
+        name = bones[gi]["name"] if 0 <= gi < len(bones) else hash_bone_name(idx)
+        groups[idx] = obj.vertex_groups.new(name=name)
+    if not groups:
+        return
+    buckets = {}
+    for vi in range(used_bones.shape[0]):
+        slot = int(used_bones[vi, 0]) if used_bones.shape[1] else -1
+        if slot in groups:
+            buckets.setdefault(slot, []).append(vi)
+    for slot, vertices in buckets.items():
+        groups[slot].add(vertices, 1.0, "REPLACE")
 
 
 def _stored_tangents(mesh, nverts: int):
@@ -267,13 +343,27 @@ def import_mesh(filepath: str, scale: float = 1.0, armature=None):
             mesh.polygons[p].material_index = min(si, nsub - 1)
         start = poly_last
 
-    # skinning
+    # skinning: the channel table — not the always-present arrays — says what
+    # this mesh is.  A static prop stays a free object; a rigid mesh (one bone
+    # index per vertex, no weights) gets weight 1 on that bone.
     bones, local = _bone_view(data, meta)
-    if armature is None and "bindpose" in data and "bones" in data and "weights" in data and bones:
+    mode = skin_mode(data, meta)
+    skinned = mode != "none" and bool(bones) and bool(local) and "bones" in data
+    if skinned and mode == "smooth" and "weights" not in data:
+        skinned = False
+    if armature is None and skinned and "bindpose" in data:
         armature = build_armature(mesh.name + "_arm", bones, scale=scale)
-    if armature is not None and "bones" in data and "weights" in data and bones:
-        _apply_weights(obj, local, np.asarray(data["bones"]), bones,
-                       np.asarray(data["weights"]), len(local))
+    if armature is not None and skinned:
+        used_bones = np.asarray(data["bones"], dtype=np.int64)
+        if used_bones.ndim == 1:                 # very old writer: flat list
+            used_bones = used_bones.reshape(-1, 1)
+        if mode == "rigid":
+            _apply_rigid_weights(obj, local, used_bones, bones)
+        else:
+            weight_values = np.asarray(data["weights"], dtype=np.float64)
+            if weight_values.ndim == 1:
+                weight_values = weight_values.reshape(-1, 1)
+            _apply_weights(obj, local, used_bones, bones, weight_values, len(local))
         obj.parent = armature
         for mod in list(obj.modifiers):
             if mod.type == "ARMATURE":
@@ -281,17 +371,23 @@ def import_mesh(filepath: str, scale: float = 1.0, armature=None):
         mod = obj.modifiers.new("Armature", "ARMATURE")
         mod.object = armature
         mod.use_vertex_groups = True
+    # recorded so export knows this mesh is skinned even if the user later clears
+    # every weight; static props must never borrow the scene's bone table
+    obj["exmt_skinned"] = 1 if skinned else 0
 
     obj["exmt_meta"] = json.dumps(meta, ensure_ascii=False)
     # the export needs to map group names back to this mesh's own bone indices, and
-    # the rest transforms make an exported file self-contained
-    obj["exmt_bones"] = json.dumps([
-        {"name": (bones[local[i]]["name"] if i < len(local) and local[i] < len(bones)
-                  else hash_bone_name(i)),
-         "hash": (int(bones[local[i]]["hash"]) if i < len(local) and local[i] < len(bones) else 0),
-         "rest": (bones[local[i]].get("rest") if i < len(local) and local[i] < len(bones) else None)}
-        for i in range(len(local))
-    ], ensure_ascii=False)
+    # the rest transforms make an exported file self-contained.  A static mesh has
+    # no such table: writing an empty/union one made the packer believe it was
+    # skinned and emit a bogus bind pose.
+    if skinned:
+        obj["exmt_bones"] = json.dumps([
+            {"name": (bones[local[i]]["name"] if i < len(local) and local[i] < len(bones)
+                      else hash_bone_name(i)),
+             "hash": (int(bones[local[i]]["hash"]) if i < len(local) and local[i] < len(bones) else 0),
+             "rest": (bones[local[i]].get("rest") if i < len(local) and local[i] < len(bones) else None)}
+            for i in range(len(local))
+        ], ensure_ascii=False)
     # carry the game's full typetree (bone hashes, bind poses, submesh descriptors,
     # collision meshes …) so the export can hand every field back unchanged
     if meta.get("tree"):
@@ -399,6 +495,33 @@ def reuse_rig(obj, bone_table: list, report=None):
     return rig
 
 
+def _has_weights(obj) -> bool:
+    data = getattr(obj, "data", None)
+    if data is None or not len(obj.vertex_groups):
+        return False
+    for vertex in data.vertices:
+        for group in vertex.groups:
+            if group.weight > 1e-6:
+                return True
+    return False
+
+
+def has_skin(obj) -> bool:
+    """True when this object really carries skinning.
+
+    `exmt_skinned` is written at import from the vertex channel table, so a static
+    prop (effects plane, weapon sight/silencer) stays `0` even before any group
+    exists.  Legacy objects have no flag: a non-empty own table means they came
+    from a game mesh, and the weight scan also catches anything the user weighted
+    by hand (including weights painted onto a static prop after import).
+    """
+    if obj.get("exmt_skinned"):
+        return True
+    if obj.get("exmt_bones"):
+        return True
+    return _has_weights(obj)
+
+
 def _hash_from_name(name: str):
     if name.startswith("bone_"):
         try:
@@ -465,7 +588,10 @@ def _bone_slots(obj, bone_table=None) -> tuple:
 
 
 def export_mesh(obj, filepath: str, meta_override: dict | None = None,
-                bone_table: list | None = None, material_slots: int | None = None) -> dict:
+                bone_table: list | None = None, material_slots: int | None = None,
+                skinned: bool | None = None) -> dict:
+    if skinned is None:
+        skinned = has_skin(obj)
     deps = bpy.context.evaluated_depsgraph_get()
     eval_obj = obj.evaluated_get(deps)
     mesh = eval_obj.to_mesh()
@@ -564,25 +690,35 @@ def export_mesh(obj, filepath: str, meta_override: dict | None = None,
     slots = max(1, min(_dim(12, 4), _dim(13, 4), 4))
     bones = np.zeros((nverts, slots), dtype=np.uint32)
     weights = np.zeros((nverts, slots), dtype=np.float32)
-    bone_slots, resolve = _bone_slots(obj, bone_table)
+    if skinned:
+        bone_slots, resolve = _bone_slots(obj, bone_table)
+    else:
+        # static prop: never borrow the scene / target table.  Even a zero-filled
+        # `bone_hashes` would make the packer treat the file as skinning.
+        bone_slots, resolve = [], lambda name: None
     bone_count = len(bone_slots)
-    if not bone_count:
+    if not bone_count and skinned:
         tree_hashes = (meta.get("tree") or {}).get("m_BoneNameHashes") or []
         bone_count = len(tree_hashes)
     group_names = {vg.index: vg.name for vg in obj.vertex_groups}
     dropped = 0
     influenced = 0
+    weighted = 0
     for i, v in enumerate(mesh.vertices):
         infl = []
+        positive = False
         for g in v.groups:
             if g.weight <= 0.0:
                 continue
+            positive = True
             name = group_names.get(g.group, "")
             bi = resolve(name)
             if bi is None or (bone_count and bi >= bone_count):
                 dropped += 1
                 continue
             infl.append((g.weight, bi))
+        if positive:
+            weighted += 1
         infl.sort(key=lambda item: (-item[0], item[1]))
         if len(infl) > slots:
             dropped += len(infl) - slots
@@ -658,7 +794,6 @@ def export_mesh(obj, filepath: str, meta_override: dict | None = None,
     meta["index_format"] = 0 if nverts < 65536 else 1
     if not meta.get("channels"):
         meta["channels"] = DEFAULT_CHANNELS
-    meta["has_bindpose"] = bool(meta.get("has_bindpose"))
     raw_tree = obj.get("exmt_tree")
     if raw_tree and not meta.get("tree"):
         try:
@@ -682,8 +817,10 @@ def export_mesh(obj, filepath: str, meta_override: dict | None = None,
         submesh_count=np.array(counts, dtype=np.uint32),
     )
     # carry this mesh's own bone table so the file stays self-contained (importing
-    # an exported file builds the rig again; packing still prefers the game's tree)
-    if bone_slots and any(b.get("hash") is not None for b in bone_slots):
+    # an exported file builds the rig again; packing still prefers the game's tree).
+    # A static prop writes none: an (empty or borrowed) table would make the packer
+    # treat it as skinned and inject a bind pose the target does not have.
+    if skinned and bone_slots and any(b.get("hash") is not None for b in bone_slots):
         arrays["bone_hashes"] = np.asarray(
             [int(b.get("hash") or 0) for b in bone_slots], dtype=np.uint32)
         rests = []
@@ -696,8 +833,7 @@ def export_mesh(obj, filepath: str, meta_override: dict | None = None,
             rests.append(np.asarray(rest, dtype=np.float64).reshape(4, 4))
         if complete:
             arrays["bindpose"] = np.linalg.inv(np.asarray(rests, dtype=np.float64)).astype(np.float32)
-    if "bindpose" in meta and meta.get("has_bindpose"):
-        pass
+    meta["has_bindpose"] = "bindpose" in arrays
     arrays["meta"] = np.array(json.dumps(meta, ensure_ascii=False))
     with open(filepath, "wb") as fh:
         np.savez_compressed(fh, **arrays)
@@ -705,5 +841,6 @@ def export_mesh(obj, filepath: str, meta_override: dict | None = None,
     eval_obj.to_mesh_clear()
     return {"verts": int(nverts), "tris": int(len(tris)), "file": filepath,
             "dropped_influences": int(dropped), "bones": int(bone_count),
-            "influenced": int(influenced), "groups": len(obj.vertex_groups),
+            "influenced": int(influenced), "weighted": int(weighted),
+            "skinned": bool(skinned), "groups": len(obj.vertex_groups),
             "submeshes": len(counts), "material_merge": meta.get("material_merge")}
