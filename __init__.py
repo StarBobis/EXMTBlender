@@ -275,8 +275,33 @@ def _image(path: str, non_color: bool = False):
     return img
 
 
+def _image_node(nodes, links, image, location, path: str = ""):
+    """Image Texture node for a workspace texture, V-flipped when it is a DDS.
+
+    The workspace DDS is the original Unity payload plus a DDS header, and Unity
+    stores rows bottom-up: loaded as a normal top-down image it would render
+    upside down.  Flipping V on the node keeps the file byte-identical to the
+    pack and still samples the upright image.  PNG workspaces (older exports)
+    load top-down and stay untouched.
+    """
+    tex = nodes.new("ShaderNodeTexImage")
+    tex.image = image
+    tex.label = os.path.basename(path) if path else (image.name if image else "")
+    tex.location = location
+    if image is not None and path.lower().endswith(".dds"):
+        uv = nodes.new("ShaderNodeUVMap")
+        uv.location = (location[0] - 470, location[1] - 240)
+        mapping = nodes.new("ShaderNodeMapping")
+        mapping.location = (location[0] - 250, location[1] - 130)
+        mapping.inputs["Scale"].default_value[1] = -1.0
+        mapping.inputs["Location"].default_value[1] = 1.0
+        links.new(uv.outputs["UV"], mapping.inputs["Vector"])
+        links.new(mapping.outputs["Vector"], tex.inputs["Vector"])
+    return tex
+
+
 def _textured_material(name: str, tex_paths: list, part: str, wanted=None):
-    """Principled material from the workspace PNGs (base colour + normal map).
+    """Principled material from the workspace textures (base colour + normal map).
 
     `wanted` is the workspace's `groups[mesh]` list: the exact textures the core
     paired with this submesh.  It wins over name guessing, which used to give the
@@ -312,16 +337,10 @@ def _textured_material(name: str, tex_paths: list, part: str, wanted=None):
         return mat
 
     if base:
-        tex = nodes.new("ShaderNodeTexImage")
-        tex.image = _image(base)
-        tex.label = os.path.basename(base)
-        tex.location = (-420, 220)
+        tex = _image_node(nodes, links, _image(base), (-420, 220), base)
         links.new(tex.outputs["Color"], bsdf.inputs["Base Color"])
     if normal:
-        tex = nodes.new("ShaderNodeTexImage")
-        tex.image = _image(normal, non_color=True)
-        tex.label = os.path.basename(normal)
-        tex.location = (-420, -160)
+        tex = _image_node(nodes, links, _image(normal, non_color=True), (-420, -160), normal)
         nmap = nodes.new("ShaderNodeNormalMap")
         nmap.location = (-180, -160)
         links.new(tex.outputs["Color"], nmap.inputs["Color"])

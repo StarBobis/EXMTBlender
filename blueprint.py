@@ -179,9 +179,10 @@ def _items(tree):
 def textures(folder: str) -> list:
     """The workspace's textures with what they expect (size / format / mips).
 
-    `workspace.json` only records file + bundle, so the format comes from the
-    bundle itself; the add-on caches the answer on the tree (`texture_meta`) when
-    it imports, which keeps the node drawing instant.
+    New exports record `file` (DDS), `preview_file` (JPG), `width/height/mips/
+    format/format_name` directly; older ones only have file + bundle, so the
+    add-on caches whatever it learned on the tree (`texture_meta`) at import,
+    which keeps the node drawing instant either way.
     """
     rows = manifest(folder).get("textures")
     return rows if isinstance(rows, list) else []
@@ -255,10 +256,14 @@ def texture_kind(name: str) -> str:
 
 
 def texture_preview(tree, name: str):
-    """The extracted PNG of a game texture, as an Image datablock (or None).
+    """The extracted preview of a game texture, as an Image datablock (or None).
+
+    `preview_file` is the JPG the app writes next to the original DDS; it is
+    upright and small enough to load cheaply.  Older workspaces (and a failed
+    preview encode) only have `file`, which is then used as the fallback.
 
     Only drawn for the selected node (see `EXMTNodeTexture.draw_buttons`): loading
-    a 2048² PNG and building its preview for all twenty texture nodes on every
+    a 2048² image and building its preview for all twenty texture nodes on every
     redraw was a large part of why the graph felt stuck, so the cache here mainly
     guarantees the image is loaded once and then reused.
     """
@@ -266,7 +271,7 @@ def texture_preview(tree, name: str):
     for row in textures(folder):
         if row.get("name") != name:
             continue
-        rel = row.get("file") or ""
+        rel = row.get("preview_file") or row.get("file") or ""
         if not rel:
             return None
         path = os.path.join(folder, rel.replace("/", os.sep))
@@ -540,10 +545,11 @@ class EXMTNodeTexture(Node):
         layout.label(text=info, icon="INFO" if row.get("supported", True) else "ERROR")
 
         # The map about to be replaced, so nobody has to recognise the name by
-        # heart.  Only for the *active* node: a preview decodes a full-resolution
-        # PNG, and drawing one for all twenty texture nodes on every redraw was a
-        # large slice of the node editor's lag.  `self.select` is not enough —
-        # box-selecting the whole texture frame would bring them all back.
+        # heart.  Only for the *active* node: a preview decodes a 2048² image
+        # (preferring the upright JPG), and drawing one for all twenty texture
+        # nodes on every redraw was a large slice of the node editor's lag.
+        # `self.select` is not enough — box-selecting the whole texture frame
+        # would bring them all back.
         active = getattr(self.id_data.nodes, "active", None)
         if active is not None and active.as_pointer() == self.as_pointer():
             preview = texture_preview(self.id_data, self.texture)
